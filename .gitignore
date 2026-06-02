@@ -14,3 +14,4 @@ captured_*.json
 venv/
 .idea/
 .vscode/
+.auth_token

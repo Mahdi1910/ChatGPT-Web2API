@@ -38,6 +38,7 @@ class AutonomousDiscovery:
         self.ws = None
         self.msg_id = 0
         self.results = {}
+        self._access_token = ""
 
     async def connect(self):
         """Connect to ChatGPT page's CDP websocket."""
@@ -83,6 +84,10 @@ class AutonomousDiscovery:
     async def fetch_api(self, path: str, method: str = "GET", body: dict = None,
                         timeout: float = 30) -> dict:
         """Fetch a ChatGPT backend API endpoint using the page's auth."""
+        # Build auth header if we have a token
+        auth_header = f"Bearer {self._access_token}" if self._access_token else ""
+        auth_line = f"'Authorization': '{auth_header}'," if auth_header else ""
+
         # Build the JS expression
         if body is not None:
             body_json = json.dumps(body).replace("</script", "<\\/script")
@@ -91,7 +96,7 @@ class AutonomousDiscovery:
                 try {{
                     const r = await fetch('{path}', {{
                         method: '{method}',
-                        headers: {{'Content-Type': 'application/json'}},
+                        headers: {{{auth_line}'Content-Type': 'application/json'}},
                         credentials: 'include',
                         body: JSON.stringify({body_json})
                     }});
@@ -108,7 +113,7 @@ class AutonomousDiscovery:
                 try {{
                     const r = await fetch('{path}', {{
                         method: '{method}',
-                        headers: {{'Content-Type': 'application/json'}},
+                        headers: {{{auth_line}'Content-Type': 'application/json'}},
                         credentials: 'include'
                     }});
                     const text = await r.text();
@@ -132,12 +137,14 @@ class AutonomousDiscovery:
     async def fetch_sse(self, path: str, body: dict, timeout: float = 60) -> dict:
         """Fetch an SSE streaming endpoint, collecting the full response."""
         body_json = json.dumps(body).replace("</script", "<\\/script")
+        auth_header = f"Bearer {self._access_token}" if self._access_token else ""
+        auth_line = f"'Authorization': '{auth_header}'," if auth_header else ""
         js = f"""
         (async () => {{
             try {{
                 const r = await fetch('{path}', {{
                     method: 'POST',
-                    headers: {{'Content-Type': 'application/json'}},
+                    headers: {{{auth_line}'Content-Type': 'application/json'}},
                     credentials: 'include',
                     body: JSON.stringify({body_json})
                 }});
@@ -179,6 +186,34 @@ class AutonomousDiscovery:
         """Run the full autonomous discovery."""
         await self.connect()
 
+        # ── 0. Get access token ──────────────────────────────
+        logger.info("=== Extracting access token ===")
+        token_resp = await self.fetch_api("/api/auth/session")
+        if token_resp.get("ok"):
+            try:
+                sess = json.loads(token_resp["body"])
+                self._access_token = sess.get("accessToken", "")
+                user = sess.get("user", {})
+                logger.info("  Token obtained (%d chars)", len(self._access_token))
+                logger.info("  User: %s (%s)", user.get("name"), user.get("email"))
+                self._save("auth_session", {
+                    "user_id": user.get("id"),
+                    "name": user.get("name"),
+                    "email": user.get("email"),
+                    "expires": sess.get("expires"),
+                    "token_length": len(self._access_token),
+                })
+            except Exception as e:
+                logger.error("  Failed to parse session: %s", e)
+                self._access_token = ""
+        else:
+            logger.error("  Failed to get session: %s", token_resp.get("body", "")[:200])
+            self._access_token = ""
+
+        if not self._access_token:
+            logger.error("Cannot proceed without access token")
+            return
+
         print("\n" + "=" * 70)
         print("AUTONOMOUS CHATGPT PROTOCOL DISCOVERY")
         print("=" * 70)
@@ -191,9 +226,7 @@ class AutonomousDiscovery:
             me_data = json.loads(me["body"])
             logger.info("  User: %s (id: %s)", me_data.get("name"), me_data.get("id"))
         else:
-            logger.error("  Failed to get user info: %s", me.get("body", "")[:200])
-            logger.error("  Are you logged into ChatGPT?")
-            return
+            logger.error("  Failed: %s", me.get("body", "")[:200])
 
         # ── 2. Models ────────────────────────────────────────
         logger.info("=== Fetching model catalog ===")
