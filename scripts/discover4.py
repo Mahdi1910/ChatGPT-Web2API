@@ -77,6 +77,7 @@ class CDPCapture:
         """Connect to browser CDP and enable network capture.
 
         listen_task must already be running to receive command responses.
+        ALL reading is done by listen() — start() only sends.
         """
         # Get page targets via HTTP
         targets_url = f"http://127.0.0.1:{self.port}/json/list"
@@ -96,7 +97,7 @@ class CDPCapture:
                          if t.get("type") == "page" and "chatgpt.com" in t.get("url", "")]
         other_pages = [t for t in targets
                        if t.get("type") == "page" and "chatgpt.com" not in t.get("url", "")]
-        page_targets = (chatgpt_pages + other_pages)[:1]  # just the ChatGPT page
+        page_targets = (chatgpt_pages + other_pages)[:1]
 
         if not page_targets:
             raise RuntimeError("No page targets found")
@@ -110,20 +111,19 @@ class CDPCapture:
         logger.info("Connecting to: %s", page_title)
         self.ws = await websockets.connect(ws_url, max_size=50 * 1024 * 1024)
 
-        # Enable Network domain
-        self.msg_id += 1
-        await self.ws.send(json.dumps({"id": self.msg_id, "method": "Network.enable",
-                                        "params": {"maxPostDataSize": 65536}}))
-        resp = await asyncio.wait_for(self.ws.recv(), timeout=5)
-        logger.info("  Network.enable: %s", resp[:80])
+        # Wait for listen() to pick up the new ws and start reading
+        await asyncio.sleep(0.3)
 
-        # Auto-reload the page so Network events fire for all subsequent requests
+        # Enable Network domain (response handled by listen() -> send_cmd)
+        result = await self.send_cmd("Network.enable", {"maxPostDataSize": 65536})
+        logger.info("  Network.enable OK")
+
+        # Auto-reload so Network events fire for all subsequent requests
         logger.info("  Reloading page to activate capture...")
+        # Fire-and-forget reload (don't need the response)
         self.msg_id += 1
-        await self.ws.send(json.dumps({"id": self.msg_id, "method": "Page.reload",
-                                        "params": {}}))
-        # Wait for the reload to start producing events
-        await asyncio.sleep(3)
+        await self.ws.send(json.dumps({"id": self.msg_id, "method": "Page.reload", "params": {}}))
+        await asyncio.sleep(4)
 
         self._running = True
         logger.info("Network capture active\n")
