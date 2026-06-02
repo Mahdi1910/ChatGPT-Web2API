@@ -111,7 +111,7 @@ class CDPCapture:
         # Attach to each page target and enable Network
         for target in targets:
             if target.get("type") == "page":
-                tid = target["targetId"]
+                tid = target["id"]  # /json/list uses "id", not "targetId"
                 page_url = target.get("url", "")
                 try:
                     attach = await self.send_cmd("Target.attachToTarget", {
@@ -132,6 +132,15 @@ class CDPCapture:
 
     async def listen(self):
         """Listen for CDP events and command responses."""
+        # Wait until ws is set by start()
+        for _ in range(100):
+            if self.ws is not None:
+                break
+            await asyncio.sleep(0.1)
+        if self.ws is None:
+            logger.error("WebSocket never initialized")
+            return
+
         try:
             async for raw in self.ws:
                 try:
