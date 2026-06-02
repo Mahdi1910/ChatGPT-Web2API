@@ -1,80 +1,59 @@
-# Phase 1 Complete — ChatGPT Web Protocol (Live-Captured)
+# ChatGPT Web Protocol Reference — Live-Captured
 
-Captured: 2026-06-02 from ChatGPT Plus, Chrome 148, project-scoped conversation
+Captured: 2026-06-02 from ChatGPT Plus, Chrome 148
 
-## Conversation Flow (3 Requests)
+## Model Catalog (from GET /backend-api/models)
+
+| Slug | Title | Max Tokens | Reasoning | Enabled Tools |
+|------|-------|-----------|-----------|---------------|
+| `gpt-5-5` | GPT-5.5 | 34,834 | auto | tools, tools2, dalle_3, search, canvas |
+| `gpt-5-3` | GPT-5.3 | 34,834 | auto | tools, tools2, dalle_3, search, canvas |
+| `gpt-5-2` | GPT-5.2 | 25,384 | auto | tools, tools2, dalle_3, search, canvas |
+| `gpt-5-1` | GPT-5.1 | 17,384 | auto | tools, tools2, dalle_3, search, canvas |
+| `gpt-5` | GPT-5 | 16,384 | auto | tools, tools2, dalle_3, search, canvas |
+| `gpt-5-3-mini` | GPT-5.3 Mini | 34,834 | none | tools, tools2, dalle_3, search, canvas |
+| `gpt-5-mini` | GPT-5-mini | 8,191 | none | tools, tools2, dalle_3, search, canvas |
+| `auto` | Auto | 16,384 | auto | tools, tools2, dalle_3, search, canvas |
+
+**Thinking effort**: The web client uses a separate `thinking_effort` param in the conversation request (not a model slug). Captured value: `"extended"`. The `gpt-5-5-thinking` slug from our capture was the actual model slug used — but it's NOT in the models list. It appears to be derived: `{model_slug}-thinking` when thinking is enabled.
+
+**Note**: All models support `dalle_3` and `search` — image generation and web search are built-in.
+
+## Additional Endpoints Discovered
+
+| Endpoint | Method | Purpose |
+|----------|--------|---------|
+| `GET /backend-api/models` | GET | Full model catalog with capabilities |
+| `GET /backend-api/me` | GET | Current user info |
+| `GET /backend-api/settings/user` | GET | User settings |
+| `GET /backend-api/accounts/check/v4-2023-04-27` | GET | Account status |
+| `GET /backend-api/accounts/optimized/check` | GET | Optimized account check |
+| `GET /backend-api/user_granular_consent` | GET | User consent state |
+| `GET /backend-api/user_system_messages` | GET | System messages |
+| `GET /backend-api/system_hints` | GET | System configuration hints |
+| `GET /backend-api/pins` | GET | Pinned conversations |
+| `GET /backend-api/calpico/chatgpt/rooms/summary` | GET | Rooms/chats summary |
+
+## Conversation Flow (Complete)
 
 ### Step 1: Init
 ```
 POST /backend-api/conversation/init
 Body: {gizmo_id, conversation_id, timezone_offset_min, requested_default_model}
 ```
-Returns conversation metadata. No message content.
 
-### Step 2: Prepare (predictive — as user types)
+### Step 2: Prepare (predictive)
 ```
 POST /backend-api/f/conversation/prepare
+Body: {action, conversation_id, parent_message_id, model, conversation_mode, partial_query, ...}
 ```
-Sent while the user is still typing (`partial_query` has partial text).
-Enables "buffering" — the server starts preparing before submit.
 
-### Step 3: Conversation (the actual message)
+### Step 3: Conversation (actual message)
 ```
 POST /backend-api/f/conversation
-```
-**This carries the actual messages.** Returns SSE stream.
-
-## The Actual Request Body
-
-```json
-{
-  "action": "next",
-  "messages": [
-    {
-      "id": "<uuid>",
-      "author": {"role": "user"},
-      "create_time": 1780364131.52,
-      "content": {
-        "content_type": "text",
-        "parts": ["<user message here>"]
-      },
-      "metadata": {
-        "developer_mode_connector_ids": [],
-        "selected_sources": [],
-        "selected_github_repos": [],
-        "selected_all_github_repos": false,
-        "serialization_metadata": {"custom_symbol_offsets": []}
-      }
-    }
-  ],
-  "conversation_id": "<uuid or null for new>",
-  "parent_message_id": "<uuid>",
-  "model": "gpt-5-5-thinking",
-  "client_prepare_state": "success",
-  "timezone_offset_min": -180,
-  "timezone": "Asia/Riyadh",
-  "conversation_mode": {
-    "kind": "gizmo_interaction",
-    "gizmo_id": "g-p-<hex>"
-  },
-  "enable_message_followups": true,
-  "system_hints": [],
-  "supports_buffering": true,
-  "supported_encodings": ["v1"],
-  "client_contextual_info": {
-    "is_dark_mode": true,
-    "time_since_loaded": 604,
-    "page_height": 911,
-    "page_width": 1920,
-    "pixel_ratio": 1,
-    "screen_height": 1080,
-    "screen_width": 1920,
-    "app_name": "chatgpt.com"
-  },
-  "paragen_cot_summary_display_override": "allow",
-  "force_parallel_switch": "auto",
-  "thinking_effort": "extended"
-}
+Body: {action, messages, conversation_id, parent_message_id, model,
+       conversation_mode, enable_message_followups, supports_buffering,
+       supported_encodings, thinking_effort, ...}
 ```
 
 ## Project Scoping
@@ -82,27 +61,16 @@ POST /backend-api/f/conversation
 ```json
 "conversation_mode": {
   "kind": "gizmo_interaction",
-  "gizmo_id": "g-p-6a1cbfa6da8c8191bd3674470d2dbc22"
+  "gizmo_id": "g-p-<hex>"
 }
 ```
 
-- Projects ARE gizmo interactions
-- `gizmo_id` = the full `g-p-<hex>` (no slug suffix)
-- For non-project chats: `{"kind": "primary_assistant"}`
-
-## Sentinel Flow (3 Requests)
+## Sentinel Flow (3-Step)
 
 ```
 1. POST /backend-api/sentinel/chat-requirements/prepare
-   Body: {"p": "<base64 config>"}
-
 2. POST /backend-api/sentinel/chat-requirements/finalize
-   Body: {"prepare_token": "...", "proofofwork": "<solved>", "turnstile": "<token>"}
-   Returns: {"token": "...", "expire_after": ..., "expire_at": ...}
-
 3. POST /backend-api/sentinel/req
-   Body: {"p": "<base64>", "id": "<device-id>", "flow": "conversation"}
-   (Sent during the conversation request)
 ```
 
 ## Required Headers
@@ -110,7 +78,6 @@ POST /backend-api/f/conversation
 ```
 Authorization: Bearer <access_token>
 Content-Type: application/json
-Accept: text/event-stream
 oai-device-id: <uuid>
 oai-session-id: <uuid>
 oai-client-build-number: 7079867
@@ -118,34 +85,14 @@ oai-client-version: prod-36401cb188ce4e77c4aeaf3e74996e3602a1410d
 oai-language: en-US
 ```
 
-## Model Names
+## CDP Discovery Technique
 
-Captured model: `gpt-5-5-thinking` (GPT-5.5 with extended thinking)
-thinking_effort: "extended"
+Chrome 148+ requires `Network.enable` + page reload to capture events.
+Connect to page-level WS (`/json/list` → `webSocketDebuggerUrl`), enable Network,
+then reload page with `Page.reload`.
 
-## Streaming
+## Files
 
-Response is SSE with encoding "v1".
-Responses contain `parts` fields with incremental text.
-Stream items have UUIDs for tracking.
-
-## All Backend-API Endpoints Observed
-
-| Endpoint | Method | Purpose |
-|----------|--------|---------|
-| `/conversation/init` | POST | Initialize/load conversation metadata |
-| `/f/conversation/prepare` | POST | Predictive pre-flight while user types |
-| `/f/conversation` | POST | **Actual message + SSE response** |
-| `/sentinel/chat-requirements/prepare` | POST | Start sentinel challenge |
-| `/sentinel/chat-requirements/finalize` | POST | Submit PoW + Turnstile solution |
-| `/sentinel/req` | POST | Additional sentinel check during request |
-| `/sentinel/ping` | POST | Keepalive (every ~5s) |
-| `/sentinel/heartbeat` | POST | Heartbeat |
-| `/conversation/{id}` | GET | Load conversation history |
-| `/conversation/{id}/stream_status` | GET | Check stream state |
-| `/conversation/{id}/textdocs` | GET | Get text documents |
-| `/files/library` | POST | List uploaded files |
-| `/memories` | GET/POST | Memory management |
-| `/beacons/home` | POST | Analytics beacon |
-| `/apps/sources_dropdown` | POST | Sources dropdown data |
-| `/lat/r` | POST | Latency reporting |
+- `captured_models.json` — Full model catalog from `/backend-api/models`
+- `captured_request.json` — Phase 1 captures (conversation/init, sentinel)
+- `captured_broad.json` — Phase 1b captures (full conversation flow discovered)
