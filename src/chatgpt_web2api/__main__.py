@@ -40,6 +40,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--headless", action="store_true", help="Run browser in headless mode")
     parser.add_argument("--project", default=None, help="Default project ID")
     parser.add_argument("--proxy", default=None, help="Proxy URL for browser")
+    parser.add_argument("--cdp-endpoint", default=None,
+                        help="Connect to running browser via CDP WebSocket URL (e.g. ws://localhost:9222)")
+    parser.add_argument("--cdp-port", type=int, default=None,
+                        help="Connect to running browser via CDP port (shorthand for --cdp-endpoint ws://localhost:PORT)")
     parser.add_argument("--log-level", default=None, choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     return parser.parse_args()
 
@@ -47,22 +51,29 @@ def parse_args() -> argparse.Namespace:
 async def run_server(config: AppConfig) -> None:
     """Initialize all components and run the HTTP server."""
     # --- Browser ---
-    browser = ChatGPTBrowser(config)
+    browser = ChatGPTBrowser(
+        config,
+        cdp_endpoint=args.cdp_endpoint,
+        cdp_port=args.cdp_port,
+    )
     await browser.start()
 
     try:
-        # Navigate to ChatGPT
-        await browser.navigate(config.chatgpt.base_url)
-
-        # Check login
-        import asyncio as aio
-        await aio.sleep(3)
-
-        if not await browser.is_logged_in():
-            logger.info("Not logged in. Please log in using the browser window.")
-            await browser.wait_for_login(timeout=300)
+        # If attached to existing browser, skip login check
+        if browser._attached:
+            logger.info("Attached to existing browser — skipping login check")
         else:
-            logger.info("Already logged in.")
+            await browser.navigate(config.chatgpt.base_url)
+
+            # Check login
+            import asyncio as aio
+            await aio.sleep(3)
+
+            if not await browser.is_logged_in():
+                logger.info("Not logged in. Please log in using the browser window.")
+                await browser.wait_for_login(timeout=300)
+            else:
+                logger.info("Already logged in.")
 
         # --- Auth ---
         auth = AuthSession(browser, config.chatgpt.base_url)

@@ -33,20 +33,37 @@ class ChatGPTBrowser:
     TLS stack via Patchright's route interception.  This ensures TLS
     fingerprints, cookies, and proxy settings are indistinguishable
     from a real browser session.
+
+    Two connection modes:
+
+    * **Launch** — start a fresh Patchright browser (default).
+    * **Attach** — connect to a running browser via CDP WebSocket.
+      Use `cdp_endpoint` (full ws:// URL) or `cdp_port` (localhost).
+      The existing session's cookies, tabs, and auth state are reused
+      as-is — no login needed.
     """
 
-    def __init__(self, config: AppConfig) -> None:
+    def __init__(
+        self,
+        config: AppConfig,
+        *,
+        cdp_endpoint: Optional[str] = None,
+        cdp_port: Optional[int] = None,
+    ) -> None:
         self._config = config
+        self._cdp_endpoint = cdp_endpoint
+        self._cdp_port = cdp_port
         self._playwright: Any = None
         self._browser: Any = None
         self._context: Any = None
         self._page: Any = None
         self._started = False
+        self._attached = False  # True when connected to external browser
 
     # -- Lifecycle --
 
     async def start(self) -> None:
-        """Launch the browser with stealth settings."""
+        """Start the browser — launch fresh or attach to existing session."""
         if self._started:
             return
         if not _try_browser:
@@ -55,8 +72,63 @@ class ChatGPTBrowser:
                 "pip install super-browser[patchright]"
             )
 
-        logger.info("Launching Patchright browser...")
         self._playwright = await async_playwright()
+
+        # --- Attach to existing browser via CDP ---
+        cdp_url = self._resolve_cdp_url()
+        if cdp_url:
+            await self._attach(cdp_url)
+            return
+
+        # --- Launch fresh browser ---
+        await self._launch()
+
+    # -- Internal start methods --
+
+    def _resolve_cdp_url(self) -> Optional[str]:
+        """Return the CDP WebSocket URL to connect to, or None."""
+        if self._cdp_endpoint:
+            return self._cdp_endpoint
+        if self._cdp_port:
+            return f"http://localhost:{self._cdp_port}"
+        return None
+
+    async def _attach(self, cdp_url: str) -> None:
+        """Connect to an already-running browser via CDP.
+
+        The browser's existing pages, cookies, and auth state are
+        reused directly — no new context or cookies are created.
+        """
+        logger.info("Attaching to existing browser at %s", cdp_url)
+        self._browser = await self._playwright.chromium.connect_over_cdp(cdp_url)
+        self._attached = True
+
+        # Use the first existing context (the real browser session)
+        contexts = self._browser.contexts
+        if contexts:
+            self._context = contexts[0]
+            logger.info("Using existing context with %d page(s)", len(self._context.pages))
+        else:
+            raise RuntimeError(
+                "Connected to browser but no contexts found. "
+                "Make sure the browser has at least one tab open."
+            )
+
+        # Find an existing page or create one
+        pages = self._context.pages
+        if pages:
+            self._page = pages[0]
+            logger.info("Using existing page: %s", self._page.url[:80])
+        else:
+            self._page = await self._context.new_page()
+            logger.info("Created new page in existing context")
+
+        self._started = True
+        logger.info("Attached to existing browser session")
+
+    async def _launch(self) -> None:
+        """Launch a fresh Patchright browser with stealth settings."""
+        logger.info("Launching Patchright browser...")
 
         launch_args = [
             "--disable-blink-features=AutomationControlled",
@@ -90,17 +162,30 @@ class ChatGPTBrowser:
         logger.info("Browser started (headless=%s)", self._config.browser.headless)
 
     async def stop(self) -> None:
-        """Close the browser and save cookies."""
+        """Close the browser and save cookies.
+
+        When attached to an external browser, only disconnects —
+        the browser itself keeps running.
+        """
         if not self._started:
             return
 
-        # Save cookies before closing
+        # Save cookies (works in both modes)
         await self.save_cookies()
 
-        try:
-            await self._browser.close()
-        except Exception:
-            pass
+        if self._attached:
+            # Disconnect without closing the user's browser
+            logger.info("Disconnecting from external browser")
+            try:
+                await self._browser.close()  # CDP disconnect, not browser close
+            except Exception:
+                pass
+            self._attached = False
+        else:
+            try:
+                await self._browser.close()
+            except Exception:
+                pass
         try:
             await self._playwright.stop()
         except Exception:
