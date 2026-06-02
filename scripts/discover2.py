@@ -84,8 +84,10 @@ async def main() -> None:
                 sys.exit(1)
             context = contexts[0]
             logger.info("Connected. %d page(s).", len(context.pages))
-            page = context.pages[0] if context.pages else await context.new_page()
-            logger.info("Using page: %s", page.url[:100])
+            # Use fresh tab to avoid "Frame was detached" from ChatGPT iframes
+            page = await context.new_page()
+            await page.goto("about:blank")
+            logger.info("Connected via fresh tab")
         else:
             logger.info("Launching fresh browser...")
             browser = await pw.chromium.launch(

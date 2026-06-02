@@ -94,8 +94,12 @@ async def main() -> None:
             if not ctx:
                 logger.error("No contexts. Open a tab.")
                 sys.exit(1)
-            page = ctx.pages[0] if ctx.pages else await ctx.new_page()
-            logger.info("Connected. Page: %s", page.url[:100])
+
+            # Create a fresh about:blank page to avoid "Frame was detached"
+            # when ChatGPT's Turnstile iframes are dynamically loading.
+            page = await ctx.new_page()
+            await page.goto("about:blank")
+            logger.info("Connected via fresh tab (avoids iframe detachment)")
         else:
             logger.info("Launching fresh browser...")
             browser = await pw.chromium.launch(headless=False, args=["--disable-blink-features=AutomationControlled"])

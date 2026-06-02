@@ -114,14 +114,10 @@ class ChatGPTBrowser:
                 "Make sure the browser has at least one tab open."
             )
 
-        # Find an existing page or create one
-        pages = self._context.pages
-        if pages:
-            self._page = pages[0]
-            logger.info("Using existing page: %s", self._page.url[:80])
-        else:
-            self._page = await self._context.new_page()
-            logger.info("Created new page in existing context")
+        # Create fresh tab to avoid "Frame was detached" from dynamic iframes
+        self._page = await self._context.new_page()
+        await self._page.goto("about:blank")
+        logger.info("Using fresh tab (avoids iframe detachment)")
 
         self._started = True
         logger.info("Attached to existing browser session")
