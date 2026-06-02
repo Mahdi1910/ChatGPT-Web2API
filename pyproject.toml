@@ -1,0 +1,30 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "chatgpt-web2api"
+version = "0.1.0"
+description = "OpenAI-compatible API proxy routing through ChatGPT web with project memory support"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+dependencies = [
+    "super-browser[patchright]>=0.1.0",
+    "aiohttp>=3.9",
+]
+
+[project.scripts]
+chatgpt-web2api = "chatgpt_web2api.__main__:main"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/chatgpt_web2api"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
