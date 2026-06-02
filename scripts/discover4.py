@@ -91,35 +91,39 @@ class CDPCapture:
 
         logger.info("Found %d targets", len(targets))
 
-        # Connect to each page target's websocket directly
-        for target in targets:
-            if target.get("type") != "page":
-                continue
-            ws_url = target.get("webSocketDebuggerUrl")
-            page_title = target.get("title", "")[:60]
-            if not ws_url:
-                continue
-            try:
-                page_ws = await websockets.connect(ws_url, max_size=50 * 1024 * 1024)
-                # Enable Network domain on this page
-                self.msg_id += 1
-                enable_msg = {"id": self.msg_id, "method": "Network.enable", "params": {}}
-                await page_ws.send(json.dumps(enable_msg))
-                # Read the response
-                resp = await asyncio.wait_for(page_ws.recv(), timeout=5)
-                logger.info("  Network enabled on: %s", page_title)
-                # Store this ws for listening
-                if self.ws is None:
-                    self.ws = page_ws
-                else:
-                    # For multiple pages, we'd need multiple listeners
-                    # For now just use the first ChatGPT page
-                    pass
-            except Exception as e:
-                logger.warning("  Failed on %s: %s", page_title, e)
+        # Find the ChatGPT page (prefer it over others)
+        chatgpt_pages = [t for t in targets
+                         if t.get("type") == "page" and "chatgpt.com" in t.get("url", "")]
+        other_pages = [t for t in targets
+                       if t.get("type") == "page" and "chatgpt.com" not in t.get("url", "")]
+        page_targets = (chatgpt_pages + other_pages)[:1]  # just the ChatGPT page
 
-        if self.ws is None:
-            raise RuntimeError("No page websocket connected")
+        if not page_targets:
+            raise RuntimeError("No page targets found")
+
+        target = page_targets[0]
+        ws_url = target.get("webSocketDebuggerUrl")
+        page_title = target.get("title", "")[:60]
+        if not ws_url:
+            raise RuntimeError(f"No websocket URL for {page_title}")
+
+        logger.info("Connecting to: %s", page_title)
+        self.ws = await websockets.connect(ws_url, max_size=50 * 1024 * 1024)
+
+        # Enable Network domain
+        self.msg_id += 1
+        await self.ws.send(json.dumps({"id": self.msg_id, "method": "Network.enable",
+                                        "params": {"maxPostDataSize": 65536}}))
+        resp = await asyncio.wait_for(self.ws.recv(), timeout=5)
+        logger.info("  Network.enable: %s", resp[:80])
+
+        # Auto-reload the page so Network events fire for all subsequent requests
+        logger.info("  Reloading page to activate capture...")
+        self.msg_id += 1
+        await self.ws.send(json.dumps({"id": self.msg_id, "method": "Page.reload",
+                                        "params": {}}))
+        # Wait for the reload to start producing events
+        await asyncio.sleep(3)
 
         self._running = True
         logger.info("Network capture active\n")
