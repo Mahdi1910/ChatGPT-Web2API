@@ -90,7 +90,7 @@ class ChatGPTBrowser:
         if self._cdp_endpoint:
             return self._cdp_endpoint
         if self._cdp_port:
-            return f"http://localhost:{self._cdp_port}"
+            return f"http://127.0.0.1:{self._cdp_port}"
         return None
 
     async def _attach(self, cdp_url: str) -> None:

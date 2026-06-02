@@ -91,7 +91,7 @@ async def main() -> None:
         # --- Connect or launch ---
         cdp_url = args.cdp_endpoint
         if not cdp_url and args.cdp_port:
-            cdp_url = f"http://localhost:{args.cdp_port}"
+            cdp_url = f"http://127.0.0.1:{args.cdp_port}"
 
         if cdp_url:
             logger.info("Connecting to existing browser at %s", cdp_url)
