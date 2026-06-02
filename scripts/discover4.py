@@ -73,7 +73,11 @@ class CDPCapture:
         await self.ws.send(json.dumps(msg))
         return await asyncio.wait_for(fut, timeout=10)
 
-    async def start(self):
+    async def start(self, listen_task: asyncio.Task):
+        """Connect to browser CDP and enable network capture.
+
+        listen_task must already be running to receive command responses.
+        """
         # Get browser websocket URL
         url = f"http://127.0.0.1:{self.port}/json/version"
         if httpx:
@@ -91,32 +95,43 @@ class CDPCapture:
         self.ws = await websockets.connect(ws_url, max_size=50 * 1024 * 1024)
         self._running = True
 
-        # Enable Network domain on ALL targets
-        # First get all targets
-        result = await self.send_cmd("Target.getTargets")
-        targets = result.get("result", {}).get("targetInfos", [])
+        # Get all page targets via HTTP (simpler than CDP)
+        targets_url = f"http://127.0.0.1:{self.port}/json/list"
+        if httpx:
+            async with httpx.AsyncClient() as c:
+                resp = await c.get(targets_url)
+                targets = resp.json()
+        else:
+            req = urllib.request.Request(targets_url)
+            with urllib.request.urlopen(req) as resp:
+                targets = json.loads(resp.read())
+
         logger.info("Found %d targets", len(targets))
 
         # Attach to each page target and enable Network
         for target in targets:
             if target.get("type") == "page":
                 tid = target["targetId"]
+                page_url = target.get("url", "")
                 try:
                     attach = await self.send_cmd("Target.attachToTarget", {
                         "targetId": tid, "flatten": True
                     })
                     sid = attach.get("result", {}).get("sessionId")
                     if sid:
-                        # Enable Network on this session
-                        await self.send_cmd("Network.enable", {})
-                        logger.info("  Enabled Network on: %s", target.get("url", "")[:80])
+                        # Enable Network on this target's session
+                        self.msg_id += 1
+                        msg = {"id": self.msg_id, "method": "Network.enable",
+                               "params": {}, "sessionId": sid}
+                        await self.ws.send(json.dumps(msg))
+                        logger.info("  Enabled Network on: %s", page_url[:80])
                 except Exception as e:
-                    logger.warning("  Failed to attach to %s: %s", target.get("url", "")[:60], e)
+                    logger.warning("  Failed: %s: %s", page_url[:60], e)
 
-        logger.info("Network interception active on all pages\n")
+        logger.info("Network capture active on all pages\n")
 
     async def listen(self):
-        """Listen for CDP events."""
+        """Listen for CDP events and command responses."""
         try:
             async for raw in self.ws:
                 try:
@@ -249,10 +264,14 @@ async def main() -> None:
     args = parser.parse_args()
 
     cap = CDPCapture(args.cdp_port)
-    await cap.start()
 
-    # Start listening in background
+    # Start listen loop FIRST so it can receive command responses
     listen_task = asyncio.create_task(cap.listen())
+    # Give the listener a moment to start
+    await asyncio.sleep(0.1)
+
+    # Now connect and enable network (sends commands that the listener handles)
+    await cap.start(listen_task)
 
     # Guided walkthrough
     features = [
