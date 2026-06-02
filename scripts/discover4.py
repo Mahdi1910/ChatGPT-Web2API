@@ -78,24 +78,7 @@ class CDPCapture:
 
         listen_task must already be running to receive command responses.
         """
-        # Get browser websocket URL
-        url = f"http://127.0.0.1:{self.port}/json/version"
-        if httpx:
-            async with httpx.AsyncClient() as c:
-                resp = await c.get(url)
-                info = resp.json()
-        else:
-            req = urllib.request.Request(url)
-            with urllib.request.urlopen(req) as resp:
-                info = json.loads(resp.read())
-
-        ws_url = info["webSocketDebuggerUrl"]
-        logger.info("Connecting to %s", ws_url)
-
-        self.ws = await websockets.connect(ws_url, max_size=50 * 1024 * 1024)
-        self._running = True
-
-        # Get all page targets via HTTP (simpler than CDP)
+        # Get page targets via HTTP
         targets_url = f"http://127.0.0.1:{self.port}/json/list"
         if httpx:
             async with httpx.AsyncClient() as c:
@@ -108,27 +91,38 @@ class CDPCapture:
 
         logger.info("Found %d targets", len(targets))
 
-        # Attach to each page target and enable Network
+        # Connect to each page target's websocket directly
         for target in targets:
-            if target.get("type") == "page":
-                tid = target["id"]  # /json/list uses "id", not "targetId"
-                page_url = target.get("url", "")
-                try:
-                    attach = await self.send_cmd("Target.attachToTarget", {
-                        "targetId": tid, "flatten": True
-                    })
-                    sid = attach.get("result", {}).get("sessionId")
-                    if sid:
-                        # Enable Network on this target's session
-                        self.msg_id += 1
-                        msg = {"id": self.msg_id, "method": "Network.enable",
-                               "params": {}, "sessionId": sid}
-                        await self.ws.send(json.dumps(msg))
-                        logger.info("  Enabled Network on: %s", page_url[:80])
-                except Exception as e:
-                    logger.warning("  Failed: %s: %s", page_url[:60], e)
+            if target.get("type") != "page":
+                continue
+            ws_url = target.get("webSocketDebuggerUrl")
+            page_title = target.get("title", "")[:60]
+            if not ws_url:
+                continue
+            try:
+                page_ws = await websockets.connect(ws_url, max_size=50 * 1024 * 1024)
+                # Enable Network domain on this page
+                self.msg_id += 1
+                enable_msg = {"id": self.msg_id, "method": "Network.enable", "params": {}}
+                await page_ws.send(json.dumps(enable_msg))
+                # Read the response
+                resp = await asyncio.wait_for(page_ws.recv(), timeout=5)
+                logger.info("  Network enabled on: %s", page_title)
+                # Store this ws for listening
+                if self.ws is None:
+                    self.ws = page_ws
+                else:
+                    # For multiple pages, we'd need multiple listeners
+                    # For now just use the first ChatGPT page
+                    pass
+            except Exception as e:
+                logger.warning("  Failed on %s: %s", page_title, e)
 
-        logger.info("Network capture active on all pages\n")
+        if self.ws is None:
+            raise RuntimeError("No page websocket connected")
+
+        self._running = True
+        logger.info("Network capture active\n")
 
     async def listen(self):
         """Listen for CDP events and command responses."""
