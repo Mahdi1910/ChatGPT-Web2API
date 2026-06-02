@@ -72,7 +72,7 @@ class ChatGPTBrowser:
                 "pip install super-browser[patchright]"
             )
 
-        self._playwright = await async_playwright()
+        self._playwright = await async_playwright().start()
 
         # --- Attach to existing browser via CDP ---
         cdp_url = self._resolve_cdp_url()

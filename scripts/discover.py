@@ -53,37 +53,21 @@ async def main() -> None:
     parser = argparse.ArgumentParser(
         description="ChatGPT API discovery script — capture conversation request format",
     )
-    # Connection mode
     conn = parser.add_argument_group("Connection")
-    conn.add_argument(
-        "--cdp-endpoint", default=None,
-        help="Connect to running browser via CDP WebSocket URL (e.g. ws://localhost:9222)",
-    )
-    conn.add_argument(
-        "--cdp-port", type=int, default=None,
-        help="Connect to running browser via localhost CDP port (shorthand for --cdp-endpoint)",
-    )
+    conn.add_argument("--cdp-endpoint", default=None,
+                       help="Connect via CDP WebSocket URL (e.g. ws://localhost:9222)")
+    conn.add_argument("--cdp-port", type=int, default=None,
+                       help="Connect via localhost CDP port")
 
-    # Options
-    parser.add_argument(
-        "--project",
-        default="g-p-6a1cbfa6da8c8191bd3674470d2dbc22-orqestra",
-        help="Project ID to test (default: Orqestra project)",
-    )
-    parser.add_argument(
-        "--cookie-file",
-        default=None,
-        help="Path to saved cookies JSON for session restoration",
-    )
-    parser.add_argument(
-        "--output",
-        default="captured_request.json",
-        help="Output file for captured payload",
-    )
-    parser.add_argument(
-        "--navigate", action="store_true", default=False,
-        help="Auto-navigate to the project page (skip if you're already there)",
-    )
+    parser.add_argument("--project",
+                        default="g-p-6a1cbfa6da8c8191bd3674470d2dbc22-orqestra",
+                        help="Project ID to test")
+    parser.add_argument("--cookie-file", default=None,
+                        help="Path to saved cookies JSON")
+    parser.add_argument("--output", default="captured_request.json",
+                        help="Output file for captured payload")
+    parser.add_argument("--navigate", action="store_true", default=False,
+                        help="Auto-navigate to the project page")
     args = parser.parse_args()
 
     try:
@@ -92,18 +76,17 @@ async def main() -> None:
         logger.error("patchright is required: pip install super-browser[patchright]")
         sys.exit(1)
 
-    # --- Storage for captured data ---
     captured_requests: list[dict] = []
     captured_responses: list[dict] = []
     sentinel_requests: list[dict] = []
     auth_requests: list[dict] = []
 
-    pw = await async_playwright()
     browser = None
     context = None
     page = None
     attached = False
 
+    pw = await async_playwright().start()
     try:
         # --- Connect or launch ---
         cdp_url = args.cdp_endpoint
@@ -123,7 +106,6 @@ async def main() -> None:
             context = contexts[0]
             logger.info("Connected. Context has %d page(s).", len(context.pages))
 
-            # Use an existing page or create one
             if context.pages:
                 page = context.pages[0]
                 logger.info("Using existing page: %s", page.url[:100])
@@ -144,17 +126,14 @@ async def main() -> None:
                     "Chrome/137.0.0.0 Safari/537.36"
                 ),
             )
-
             if args.cookie_file and Path(args.cookie_file).exists():
                 cookies = json.loads(Path(args.cookie_file).read_text())
                 await context.add_cookies(cookies)
                 logger.info("Restored %d cookies from %s", len(cookies), args.cookie_file)
-
             page = await context.new_page()
 
-        # --- Set up request interception ---
-        async def intercept_request(route):
-            """Record ChatGPT backend API calls without blocking them."""
+        # --- Intercept requests ---
+        async def on_route(route):
             request = route.request
             url = request.url
 
@@ -180,7 +159,8 @@ async def main() -> None:
                         for key in entry["body"]:
                             kl = key.lower()
                             if "project" in kl or "gizmo" in kl or "scope" in kl:
-                                logger.info("SCOPE FIELD: %s = %s", key, json.dumps(entry["body"][key], indent=2))
+                                logger.info("SCOPE FIELD: %s = %s",
+                                            key, json.dumps(entry["body"][key], indent=2))
                     logger.info("=" * 60)
                 except Exception as e:
                     logger.warning("Failed to capture conversation request: %s", e)
@@ -189,14 +169,12 @@ async def main() -> None:
                 try:
                     post_data = request.post_data
                     headers = await request.all_headers()
-                    entry = {
-                        "url": url,
-                        "method": request.method,
+                    sentinel_requests.append({
+                        "url": url, "method": request.method,
                         "headers": dict(headers),
                         "body": json.loads(post_data) if post_data else None,
                         "timestamp": time.time(),
-                    }
-                    sentinel_requests.append(entry)
+                    })
                     logger.info("Captured sentinel/chat-requirements request")
                 except Exception as e:
                     logger.warning("Failed to capture sentinel request: %s", e)
@@ -204,78 +182,74 @@ async def main() -> None:
             elif "/api/auth/session" in url:
                 try:
                     headers = await request.all_headers()
-                    entry = {
-                        "url": url,
-                        "method": request.method,
-                        "headers": dict(headers),
-                        "timestamp": time.time(),
-                    }
-                    auth_requests.append(entry)
+                    auth_requests.append({
+                        "url": url, "method": request.method,
+                        "headers": dict(headers), "timestamp": time.time(),
+                    })
                     logger.info("Captured auth/session request")
                 except Exception as e:
                     logger.warning("Failed to capture auth request: %s", e)
 
             await route.continue_()
 
-        async def intercept_response(response):
-            """Record responses from ChatGPT backend."""
+        def on_response(response):
             url = response.url
-
             if "/backend-api/conversation" in url:
-                try:
-                    body = await response.text()
-                    headers = await response.all_headers()
-                    captured_responses.append({
-                        "url": url,
-                        "status": response.status,
-                        "headers": dict(headers),
-                        "body_preview": body[:10000] if body else None,
-                        "timestamp": time.time(),
-                    })
-                    logger.info("Captured conversation response (status=%d, %d bytes)",
-                                response.status, len(body) if body else 0)
-                except Exception as e:
-                    logger.warning("Failed to capture conversation response: %s", e)
+                async def _cap_conv():
+                    try:
+                        body = await response.text()
+                        headers = await response.all_headers()
+                        captured_responses.append({
+                            "url": url, "status": response.status,
+                            "headers": dict(headers),
+                            "body_preview": body[:10000] if body else None,
+                            "timestamp": time.time(),
+                        })
+                        logger.info("Captured conversation response (status=%d, %d bytes)",
+                                    response.status, len(body) if body else 0)
+                    except Exception as e:
+                        logger.warning("Failed to capture conversation response: %s", e)
+                asyncio.ensure_future(_cap_conv())
 
             elif "/backend-api/sentinel/chat-requirements" in url:
-                try:
-                    body = await response.text()
-                    data = json.loads(body) if body else {}
-                    sentinel_requests.append({
-                        "url": url,
-                        "status": response.status,
-                        "body": data,
-                        "timestamp": time.time(),
-                    })
-                    if isinstance(data, dict):
-                        logger.info("Sentinel response keys: %s", list(data.keys()))
-                        if "proofofwork" in data:
-                            pw_d = data["proofofwork"]
-                            logger.info("PoW: seed=%s... difficulty=%s",
-                                        str(pw_d.get("seed", ""))[:20],
-                                        pw_d.get("difficulty"))
-                        if "turnstile" in data:
-                            logger.info("Turnstile: %s", data["turnstile"])
-                except Exception as e:
-                    logger.warning("Failed to capture sentinel response: %s", e)
+                async def _cap_sent():
+                    try:
+                        body = await response.text()
+                        data = json.loads(body) if body else {}
+                        sentinel_requests.append({
+                            "url": url, "status": response.status,
+                            "body": data, "timestamp": time.time(),
+                        })
+                        if isinstance(data, dict):
+                            logger.info("Sentinel response keys: %s", list(data.keys()))
+                            if "proofofwork" in data:
+                                pw_d = data["proofofwork"]
+                                logger.info("PoW: seed=%s... difficulty=%s",
+                                            str(pw_d.get("seed", ""))[:20],
+                                            pw_d.get("difficulty"))
+                            if "turnstile" in data:
+                                logger.info("Turnstile: %s", data["turnstile"])
+                    except Exception as e:
+                        logger.warning("Failed to capture sentinel response: %s", e)
+                asyncio.ensure_future(_cap_sent())
 
             elif "/api/auth/session" in url:
-                try:
-                    body = await response.text()
-                    auth_requests.append({
-                        "url": url,
-                        "status": response.status,
-                        "body_preview": body[:2000] if body else None,
-                        "timestamp": time.time(),
-                    })
-                    logger.info("Captured auth response (status=%d)", response.status)
-                except Exception as e:
-                    logger.warning("Failed to capture auth response: %s", e)
+                async def _cap_auth():
+                    try:
+                        body = await response.text()
+                        auth_requests.append({
+                            "url": url, "status": response.status,
+                            "body_preview": body[:2000] if body else None,
+                            "timestamp": time.time(),
+                        })
+                        logger.info("Captured auth response (status=%d)", response.status)
+                    except Exception as e:
+                        logger.warning("Failed to capture auth response: %s", e)
+                asyncio.ensure_future(_cap_auth())
 
-        # Register interception
-        await page.route("**/backend-api/**", intercept_request)
-        await page.route("**/api/auth/**", intercept_request)
-        page.on("response", intercept_response)
+        await page.route("**/backend-api/**", on_route)
+        await page.route("**/api/auth/**", on_route)
+        page.on("response", on_response)
         logger.info("Network interception active")
 
         # --- Navigate if needed ---
@@ -284,18 +258,18 @@ async def main() -> None:
         if attached and "chatgpt.com" in current_url:
             logger.info("Already on ChatGPT: %s", current_url[:100])
             if args.navigate:
-                project_url = f"https://chatgpt.com/g/{args.project}/project"
-                logger.info("Navigating to project: %s", project_url)
-                await page.goto(project_url, wait_until="domcontentloaded")
+                await page.goto(
+                    f"https://chatgpt.com/g/{args.project}/project",
+                    wait_until="domcontentloaded",
+                )
                 await asyncio.sleep(3)
         elif attached:
-            # Attached but not on ChatGPT
             logger.info("Current page: %s", current_url[:100])
             logger.info("Navigating to ChatGPT...")
             await page.goto("https://chatgpt.com", wait_until="domcontentloaded")
             await asyncio.sleep(3)
 
-            if "auth/login" in page.url:
+            if "auth/login" in page.url or "auth0" in page.url:
                 logger.info("=" * 60)
                 logger.info("NOT LOGGED IN. Log in using the browser, then come back.")
                 logger.info("Waiting for login...")
@@ -309,17 +283,17 @@ async def main() -> None:
                     sys.exit(1)
 
             if args.navigate:
-                project_url = f"https://chatgpt.com/g/{args.project}/project"
-                logger.info("Navigating to project: %s", project_url)
-                await page.goto(project_url, wait_until="domcontentloaded")
+                await page.goto(
+                    f"https://chatgpt.com/g/{args.project}/project",
+                    wait_until="domcontentloaded",
+                )
                 await asyncio.sleep(3)
         else:
-            # Fresh browser
             logger.info("Navigating to chatgpt.com...")
             await page.goto("https://chatgpt.com", wait_until="domcontentloaded")
             await asyncio.sleep(3)
 
-            if "auth/login" in page.url:
+            if "auth/login" in page.url or "auth0" in page.url:
                 logger.info("=" * 60)
                 logger.info("NOT LOGGED IN. Please log in using the browser window.")
                 logger.info("Waiting for login...")
@@ -332,19 +306,19 @@ async def main() -> None:
                     logger.error("Login timeout (5 minutes).")
                     sys.exit(1)
 
-            # Save cookies
             cookies = await context.cookies()
             cookie_path = Path(args.output).parent / "captured_cookies.json"
             cookie_path.write_text(json.dumps(cookies, indent=2))
             logger.info("Saved %d cookies to %s", len(cookies), cookie_path)
 
             if args.navigate:
-                project_url = f"https://chatgpt.com/g/{args.project}/project"
-                logger.info("Navigating to project: %s", project_url)
-                await page.goto(project_url, wait_until="domcontentloaded")
+                await page.goto(
+                    f"https://chatgpt.com/g/{args.project}/project",
+                    wait_until="domcontentloaded",
+                )
                 await asyncio.sleep(3)
 
-        # --- Ready to capture ---
+        # --- Ready ---
         logger.info("=" * 60)
         logger.info("INTERCEPTION ACTIVE. Current page: %s", page.url[:100])
         logger.info("")
@@ -365,14 +339,13 @@ async def main() -> None:
             pass
 
     finally:
-        # --- Save all captures ---
+        # --- Save captures ---
         output = {
             "conversation_requests": captured_requests,
             "conversation_responses": captured_responses,
             "sentinel_requests": sentinel_requests,
             "auth_requests": auth_requests,
         }
-
         output_path = Path(args.output)
         output_path.write_text(json.dumps(output, indent=2, default=str))
 
@@ -397,16 +370,6 @@ async def main() -> None:
                         v_str = v_str[:200] + "..."
                     logger.info("  %s: %s", k, v_str)
 
-        if not attached and browser:
-            # Save cookies from fresh browser
-            try:
-                cookies = await context.cookies()
-                cookie_path = Path(args.output).parent / "captured_cookies.json"
-                cookie_path.write_text(json.dumps(cookies, indent=2))
-            except Exception:
-                pass
-
-        # Cleanup
         if attached:
             logger.info("Disconnecting from browser (browser stays open)")
         if browser:
