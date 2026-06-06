@@ -1,7 +1,7 @@
 # ChatGPT Web Protocol Reference — Autonomous Discovery
 
 Autonomously captured: 2026-06-02 via CDP Runtime.evaluate + Bearer token auth
-Account: ChatGPT Plus (nalajmah@gmail.com)
+Account: ChatGPT Plus (user@example.com)
 Success: 21/28 endpoints
 
 ## Authentication
@@ -252,8 +252,8 @@ Captured from real conversation: "Model Inquiry" (gpt-5-5-thinking)
 ```json
 {
   "id": "ua-87c65f22-31e2-4f62-970f-05e4bd43da81",
-  "name": "Nabeel Alajmah",
-  "email": "nalajmah@gmail.com",
+  "name": "User",
+  "email": "user@example.com",
   "country": "SA",
   "region": "Mecca Region",
   "plan_type": "plus",
