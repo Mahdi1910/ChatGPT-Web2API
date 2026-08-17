@@ -11,7 +11,7 @@ def test_tool_count():
     """15 tools defined."""
     from chatgpt_web2api.mcp_server import _build_tools
     tools = _build_tools()
-    assert len(tools) == 16
+    assert len(tools) == 17
 
 
 def test_tool_names_match_enum():
@@ -55,6 +55,7 @@ def test_pydantic_schemas_valid():
     """Pydantic input schemas produce valid JSON Schema."""
     from chatgpt_web2api.mcp_server import (
         ArchiveConversationInput,
+        BranchConversationInput,
         ChatCompletionInput,
         ChatWithGptInput,
         CreateMemoryInput,
@@ -74,7 +75,7 @@ def test_pydantic_schemas_valid():
         ChatCompletionInput, ListModelsInput, ListProjectsInput,
         GetConversationInput, ListConversationsInput, DeleteConversationInput,
         CreateProjectInput, UpdateProjectInstructionsInput,
-        ArchiveConversationInput, ListMemoriesInput, CreateMemoryInput,
+        ArchiveConversationInput, BranchConversationInput, ListMemoriesInput, CreateMemoryInput,
         DeleteMemoryInput, ListGptsInput, ListProjectFilesInput,
         ChatWithGptInput,
     ]

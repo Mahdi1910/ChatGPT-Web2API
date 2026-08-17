@@ -38,6 +38,7 @@ import asyncio
 import json
 import logging
 import time
+import urllib.parse
 
 from .breakers import BreakerKind
 
@@ -232,7 +233,7 @@ class BackendClient:
             return ""
         if not url or "/c/" not in url:
             return ""
-        return url.split("/c/")[1].split("/")[0].split("?")[0]
+        return urllib.parse.unquote(url.split("/c/")[1].split("/")[0].split("?")[0])
 
     async def _get_live_conversation_id_best_effort(self) -> str:
         """Resolve the in-flight conversation id by cheapest available source.

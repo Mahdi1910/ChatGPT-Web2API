@@ -255,6 +255,7 @@ setups, local development, and debugging (logs go straight to stderr):
 | `delete_project` | Permanently remove a project (gated: `W2A_ENABLE_DESTRUCTIVE`) |
 | `list_conversations` | Recent chats with pagination |
 | `get_conversation` | Full message history |
+| `branch_conversation` | Branch from one uniquely matched assistant answer |
 | `archive_conversation` | Archive/unarchive (reversible) |
 | `delete_conversation` | Delete permanently |
 | `list_memories` | Facts ChatGPT remembers (41 found in testing) |
@@ -274,7 +275,7 @@ The MCP server has **no authentication of its own** — any client that can reac
 | Tier | Tools | Exposed when |
 |------|-------|--------------|
 | **Safe** (always visible) | `chat_completion`, `chat_with_gpt`, `list_models`, `list_projects`, `list_conversations`, `get_conversation`, `list_memories`, `list_gpts`, `list_project_files` | Out of the box |
-| **Write** (account mutation) | `create_project`, `update_project_instructions`, `create_memory`, `archive_conversation` | `W2A_ENABLE_WRITE=1` |
+| **Write** (account mutation) | `create_project`, `update_project_instructions`, `create_memory`, `archive_conversation`, `branch_conversation` | `W2A_ENABLE_WRITE=1` |
 | **Destructive** (irreversible) | `delete_conversation`, `delete_memory` | `W2A_ENABLE_DESTRUCTIVE=1` |
 
 ```bash
@@ -338,7 +339,7 @@ curl http://localhost:8080/v1/chat/completions ...
 | **Anti-bot handling** | ✅ Automatic (CDP) | ❌ Manual (PoW/Turnstile) | ❌ Manual | N/A |
 | **Token extraction** | ❌ None needed | ✅ Required | ✅ Required | N/A |
 | **Project memory** | ✅ Full CRUD | ❌ | ❌ | ❌ |
-| **MCP server** | ✅ 16 tools | ❌ | ❌ | ❌ |
+| **MCP server** | ✅ 17 tools | ❌ | ❌ | ❌ |
 | **ChatGPT memories** | ✅ List/create/delete | ❌ | ❌ | ❌ |
 | **Custom GPTs** | ✅ Chat with any GPT | ❌ | ❌ | ❌ |
 | **OpenAI SDK compat** | ✅ Drop-in | ✅ | ❌ | ✅ (native) |
@@ -367,6 +368,7 @@ delete_memory(memory_id="abc-123")
 
 # List and manage conversations
 list_conversations(limit=10)
+branch_conversation(conversation_id="xyz", message_snippet="unique assistant text")
 archive_conversation(conversation_id="xyz", archive=True)
 
 # Chat with a Custom GPT

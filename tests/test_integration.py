@@ -117,7 +117,7 @@ async def test_client_sees_full_surface_with_both_gates(monkeypatch):
     try:
         resp = await session.list_tools()
         names = {t.name for t in resp.tools}
-        assert len(names) == 16
+        assert len(names) == 17
         assert ToolName.DELETE_MEMORY.value in names
         assert ToolName.CREATE_PROJECT.value in names
     finally:

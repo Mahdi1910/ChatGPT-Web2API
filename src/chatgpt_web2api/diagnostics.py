@@ -32,6 +32,7 @@ EXPECTED_SHAPES: dict[str, dict] = {
     "get_projects": {"kind": "list", "item_required_keys": ["id", "name"]},
     "get_conversations": {"kind": "list", "item_required_keys": ["id", "title"]},
     "get_conversation": {"kind": "dict", "required_keys": ["id", "messages"]},
+    "branch_conversation": {"kind": "dict", "required_keys": ["status", "source_conversation_id", "matches"]},
     "get_memories": {"kind": "list", "item_required_keys": ["id", "content"]},
     "list_gpts": {"kind": "list", "item_required_keys": ["id", "name"]},
     "get_project_files": {"kind": "list", "item_required_keys": ["id", "name"]},

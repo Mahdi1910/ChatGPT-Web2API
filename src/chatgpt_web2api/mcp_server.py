@@ -40,11 +40,12 @@ from typing import Any
 from mcp import types as mcp_types
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from .breakers import BreakerKind, BreakerRegistry, CircuitOpenError
 from .cdp_driver import (
     AuthExpiredError,
+    BranchConversationError,
     CDPDriver,
     GenerationStuckError,
     RateLimitError,
@@ -171,6 +172,44 @@ class ListConversationsInput(BaseModel):
         default=0,
         description="Number of conversations to skip for pagination",
     )
+
+
+class BranchConversationInput(BaseModel):
+    """Input for branching from one assistant answer in an existing chat."""
+
+    conversation_id: str = Field(
+        min_length=1,
+        description=(
+            "UUID of the source conversation. Use list_conversations to discover "
+            "conversation IDs, titles, and update times. Temporary WEB: IDs are also accepted."
+        ),
+    )
+    message_snippet: str = Field(
+        min_length=1,
+        description=(
+            "Text snippet that uniquely identifies the assistant answer to branch from. "
+            "If more than one assistant answer matches, no branch is created and all "
+            "matching candidates are returned for disambiguation."
+        ),
+    )
+    limit: int = Field(
+        default=28,
+        ge=1,
+        le=500,
+        description="Maximum assistant-answer candidates to scan (default: 28).",
+    )
+    offset: int = Field(
+        default=0,
+        ge=0,
+        description="Number of assistant-answer candidates to skip before scanning.",
+    )
+
+    @field_validator("conversation_id", "message_snippet")
+    @classmethod
+    def _not_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("must not be blank")
+        return value
 
 
 class DeleteConversationInput(BaseModel):
@@ -302,6 +341,7 @@ class ToolName(str, Enum):
     # Conversations
     GET_CONVERSATION = "get_conversation"
     LIST_CONVERSATIONS = "list_conversations"
+    BRANCH_CONVERSATION = "branch_conversation"
     DELETE_CONVERSATION = "delete_conversation"
     ARCHIVE_CONVERSATION = "archive_conversation"
     # Projects
@@ -437,6 +477,42 @@ LIST_CONVERSATIONS_OUTPUT = {
         "conversations": {"type": "array", "items": CONVERSATION_ITEM},
     },
     "required": ["conversations"],
+}
+
+BRANCH_CONVERSATION_MATCH_ITEM = {
+    "type": "object",
+    "properties": {
+        "candidate": {"type": "integer"},
+        "message_id": {"type": "string"},
+        "user_prompt": {"type": "string"},
+        "assistant_answer": {"type": "string"},
+    },
+    "required": ["candidate", "message_id", "user_prompt", "assistant_answer"],
+}
+
+BRANCH_CONVERSATION_OUTPUT = {
+    "type": "object",
+    "properties": {
+        "status": {"type": "string", "enum": ["branched", "ambiguous", "not_found"]},
+        "success": {"type": "boolean"},
+        "source_conversation_id": {"type": "string"},
+        "source_title": {"type": "string"},
+        "message_snippet": {"type": "string"},
+        "offset": {"type": "integer"},
+        "limit": {"type": "integer"},
+        "matches": {"type": "array", "items": BRANCH_CONVERSATION_MATCH_ITEM},
+        "source_message_id": {"type": ["string", "null"]},
+        "branched_conversation_id": {"type": ["string", "null"]},
+        "url": {"type": ["string", "null"]},
+        "temporary": {"type": ["boolean", "null"]},
+        "note": {"type": "string"},
+        "message": {"type": "string"},
+    },
+    "required": [
+        "status", "success", "source_conversation_id", "source_title",
+        "message_snippet", "offset", "limit", "matches", "source_message_id",
+        "branched_conversation_id", "url", "temporary", "note", "message",
+    ],
 }
 
 DELETE_RESULT_OUTPUT = {
@@ -593,6 +669,7 @@ _WRITE_GATED_TOOLS = frozenset(
         ToolName.UPDATE_PROJECT_INSTRUCTIONS.value,
         ToolName.CREATE_MEMORY.value,
         ToolName.ARCHIVE_CONVERSATION.value,
+        ToolName.BRANCH_CONVERSATION.value,
     }
 )
 
@@ -695,6 +772,7 @@ _MUTATING_TOOLS = frozenset(
     {
         ToolName.CHAT_COMPLETION.value,
         ToolName.CHAT_WITH_GPT.value,
+        ToolName.BRANCH_CONVERSATION.value,
         ToolName.DELETE_CONVERSATION.value,
         ToolName.CREATE_PROJECT.value,
         ToolName.UPDATE_PROJECT_INSTRUCTIONS.value,
@@ -892,6 +970,17 @@ async def do_list_conversations(driver: CDPDriver, args: dict) -> dict:
     }
 
 
+async def do_branch_conversation(driver: CDPDriver, args: dict) -> dict:
+    """Branch from a uniquely matched assistant answer."""
+    validated = BranchConversationInput(**args)
+    return await driver.branch_conversation(
+        conversation_id=validated.conversation_id,
+        message_snippet=validated.message_snippet,
+        limit=validated.limit,
+        offset=validated.offset,
+    )
+
+
 async def do_delete_conversation(driver: CDPDriver, args: dict) -> dict:
     """Delete a conversation."""
     validated = DeleteConversationInput(**args)
@@ -1050,7 +1139,7 @@ async def do_chat_with_gpt(
 
 
 def _build_tools() -> list[mcp_types.Tool]:
-    """Build the FULL list of tool definitions (all 15), unfiltered.
+    """Build the FULL list of tool definitions (all 17), unfiltered.
 
     Returns every tool regardless of access gates. Used by tests that
     assert the complete catalog. Runtime tool exposure goes through
@@ -1173,6 +1262,31 @@ def _build_tools() -> list[mcp_types.Tool]:
                 readOnlyHint=True,
                 destructiveHint=False,
                 idempotentHint=True,
+                openWorldHint=False,
+            ),
+        ),
+        mcp_types.Tool(
+            name=ToolName.BRANCH_CONVERSATION.value,
+            title="Branch Conversation",
+            description=(
+                "Create a new ChatGPT branch from one specific assistant answer in an "
+                "existing conversation. Use list_conversations to discover the source "
+                "conversation_id, then provide a message_snippet from the assistant answer. "
+                "The tool scans assistant answers only. If zero answers match it returns a "
+                "not-found result; if multiple answers match it returns every candidate with "
+                "the preceding user prompt and does NOT branch. With one unique match, it "
+                "opens the source conversation, targets the exact assistant message by its "
+                "backend/DOM message UUID, and uses ChatGPT's More actions → Branch in new chat "
+                "UI. Successful branches may initially have a temporary WEB: ID; sending the "
+                "first later chat_completion to that ID upgrades it to a permanent UUID."
+            ),
+            inputSchema=BranchConversationInput.model_json_schema(),
+            outputSchema=BRANCH_CONVERSATION_OUTPUT,
+            annotations=mcp_types.ToolAnnotations(
+                title="Branch Conversation",
+                readOnlyHint=False,
+                destructiveHint=False,
+                idempotentHint=False,
                 openWorldHint=False,
             ),
         ),
@@ -1450,6 +1564,23 @@ def _format_tool_result(name: str, result) -> object:
     if name in (ToolName.CHAT_COMPLETION.value, ToolName.CHAT_WITH_GPT.value):
         text_content = [mcp_types.TextContent(type="text", text=result["content"])]
         return text_content, result
+    if name == ToolName.BRANCH_CONVERSATION.value:
+        status = result.get("status")
+        if status == "branched":
+            text = (
+                f"Branched conversation: {result.get('branched_conversation_id', '')}\n"
+                f"{result.get('url', '')}"
+            )
+            if result.get("note"):
+                text += f"\n\n{result['note']}"
+        else:
+            text = result.get("message") or (
+                "Multiple assistant answers matched; no branch was created."
+                if status == "ambiguous"
+                else "No matching AI answer found"
+            )
+        return [mcp_types.TextContent(type="text", text=text)], result
+    # Status operations return status text + structured output
     # Status operations return status text + structured output
     if name in _STATUS_TOOLS:
         status = "succeeded" if result.get("success") else "failed"
@@ -1467,6 +1598,14 @@ def _map_tool_exception(exc: Exception) -> object:
     """
     # Lazy imports for circular-dependency avoidance.
 
+    if isinstance(exc, BranchConversationError):
+        return mcp_types.CallToolResult(
+            content=[mcp_types.TextContent(
+                type="text",
+                text=f"Branch operation failed: {exc}. (branch_conversation_failed)",
+            )],
+            isError=True,
+        )
     if isinstance(exc, OwnedTabRequiredError):
         return mcp_types.CallToolResult(
             content=[mcp_types.TextContent(type="text",
@@ -1699,6 +1838,7 @@ def create_server() -> Server:
             ToolName.LIST_PROJECTS.value: lambda: do_list_projects(driver),
             ToolName.GET_CONVERSATION.value: lambda: do_get_conversation(driver, arguments),
             ToolName.LIST_CONVERSATIONS.value: lambda: do_list_conversations(driver, arguments),
+            ToolName.BRANCH_CONVERSATION.value: lambda: do_branch_conversation(driver, arguments),
             ToolName.DELETE_CONVERSATION.value: lambda: do_delete_conversation(driver, arguments),
             ToolName.CREATE_PROJECT.value: lambda: do_create_project(driver, arguments),
             ToolName.DELETE_PROJECT.value: lambda: do_delete_project(driver, arguments),
@@ -1755,6 +1895,7 @@ def create_server() -> Server:
             ToolName.LIST_PROJECTS.value: lambda: do_list_projects(_driver),
             ToolName.GET_CONVERSATION.value: lambda: do_get_conversation(_driver, arguments),
             ToolName.LIST_CONVERSATIONS.value: lambda: do_list_conversations(_driver, arguments),
+            ToolName.BRANCH_CONVERSATION.value: lambda: do_branch_conversation(_driver, arguments),
             ToolName.DELETE_CONVERSATION.value: lambda: do_delete_conversation(_driver, arguments),
             ToolName.CREATE_PROJECT.value: lambda: do_create_project(_driver, arguments),
             ToolName.DELETE_PROJECT.value: lambda: do_delete_project(_driver, arguments),
