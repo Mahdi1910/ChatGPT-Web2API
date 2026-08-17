@@ -4,11 +4,25 @@
 
 Planning only. This document does **not** implement the feature.
 
+## Revision Note
+
+This plan was updated with live-captured ChatGPT DOM and URL-lifecycle information supplied after the first draft.
+
+The most important new finding is that an assistant DOM message exposes `data-message-id`, and that value corresponds 1-to-1 with the backend conversation mapping node/message UUID. The implementation should therefore use the backend message/node UUID as the **primary bridge between API matching and DOM clicking**, instead of relying primarily on message ordinal or visible text.
+
+The captured branch lifecycle is:
+
+`source conversation` → click **More actions** → click **Branch in new chat** → transient `/branch/{source_conversation_id}/{message_id}` → final temporary `/c/WEB:<uuid>` → first prompt sent → permanent `/c/<uuid>`.
+
+---
+
 ## Goal
 
 Add a new MCP tool named `branch_conversation` that reproduces ChatGPT's **Branch in new chat** action for a specific assistant answer inside an existing conversation.
 
 The tool must be safe against choosing the wrong answer: it may branch only when exactly one assistant answer matches the supplied snippet. If zero or multiple answers match, it must stop without clicking the branch action.
+
+The new tool must reuse the repository's existing conversation-fetching, verified navigation, mutation locking, MCP routing, and post-send conversation-ID lifecycle wherever possible.
 
 ---
 
@@ -26,7 +40,7 @@ The current MCP implementation already provides most of the infrastructure this 
 4. Declarative `mcp_types.Tool` definition in `_build_tools()`.
 5. Access-gating classification.
 6. Mutation-lock classification when the tool changes browser/account state.
-7. A pure-ish `do_*` business function.
+7. A `do_*` business function.
 8. Tool routing in both singleton and session-pooled MCP execution paths.
 9. Shared result formatting and exception mapping.
 10. Unit, gating, integration, and optional E2E tests.
@@ -55,7 +69,7 @@ No new conversation-list implementation should be created for the branching feat
 
 The public MCP `get_conversation` business function then walks backward from `current_node`, follows parent links, reverses the chain, filters to user/assistant text, and applies message pagination.
 
-The new branch tool should reuse the same raw conversation mapping and active-branch traversal idea, but it must retain enough information to identify a particular assistant answer and its preceding user prompt.
+The new branch tool should reuse the same raw conversation mapping and active-branch traversal idea, but it must retain the backend node/message UUID for every assistant answer so the exact same answer can later be found in the DOM.
 
 ### Existing conversation navigation
 
@@ -67,7 +81,7 @@ The new branch tool should reuse the same raw conversation mapping and active-br
 - sets `_current_conv_id` only after verified success;
 - fails closed when navigation lands in the wrong place.
 
-`CDPDriver.ensure_current_conversation(conversation_id)` is even better for this new tool because it:
+`CDPDriver.ensure_current_conversation(conversation_id)` is the preferred reuse point because it:
 
 - does nothing when the requested conversation is already open;
 - otherwise calls the verified navigation path;
@@ -82,13 +96,13 @@ The new branch tool should reuse the same raw conversation mapping and active-br
 
 The Three Dots + **Branch in new chat** clicking behavior belongs in `ChatGPTDom`, with a thin delegator on `CDPDriver`, following the existing extraction/interception seam.
 
-### Existing temporary-to-permanent behavior that may already solve part of the requirement
+### Existing temporary-to-permanent behavior
 
 After a successful send, `CDPDriver.send_and_stream` reads the current `/c/{id}` URL and replaces `_current_conv_id` with the ID found in the live URL.
 
-That means if ChatGPT opens a branch as `WEB:...`, and the first message changes the browser URL to a permanent UUID, the existing send completion path may already capture the new permanent UUID automatically.
+That means when a branch initially exists as `WEB:...`, and the first message changes the browser URL to a permanent UUID, the existing send completion path may already capture the new permanent UUID automatically.
 
-**Decision:** do not build a second independent temporary-ID lifecycle unless live tests prove it is necessary. First verify that the existing URL resolution + `_current_conv_id` update naturally performs the `WEB:` → UUID upgrade.
+**Decision:** do not build a second independent temporary-ID lifecycle unless tests prove it is necessary. First verify that the existing URL resolution + `_current_conv_id` update naturally performs the `WEB:` → UUID upgrade.
 
 ---
 
@@ -109,11 +123,15 @@ Create `BranchConversationInput` with:
 
 ### Pagination meaning
 
-For this tool, `limit` and `offset` should paginate the **assistant answers eligible to be scanned**, because the operation searches AI answers rather than conversations.
+`limit` and `offset` are for scanning the assistant-answer candidates in the source conversation.
 
-The full active conversation chain should first be reconstructed so each assistant answer keeps its preceding user prompt. Pagination is then applied to the assistant-answer candidates before snippet matching.
+The implementation should first reconstruct the active visible conversation chain so each assistant answer keeps:
 
-This avoids breaking a user-prompt/assistant-answer pair at a pagination boundary.
+- its exact backend message/node UUID;
+- its visible answer text;
+- its preceding visible user prompt.
+
+Then apply `offset`/`limit` to the assistant-answer candidates before snippet matching. This keeps a user-prompt/assistant-answer pair intact instead of cutting the pair at a raw-message pagination boundary.
 
 ### Matching semantics
 
@@ -123,8 +141,8 @@ Before comparison:
 
 - strip leading/trailing whitespace;
 - normalize Unicode consistently;
-- normalize repeated/DOM-style whitespace;
-- compare case-insensitively using a safe case-fold operation.
+- normalize repeated/editor-style whitespace;
+- compare case-insensitively with `casefold()` or equivalent.
 
 Preserve the original unmodified assistant answer text in returned results.
 
@@ -134,28 +152,45 @@ Do not silently choose the “closest” answer.
 
 ## 3. Candidate Extraction from the Conversation Mapping
 
-Add high-level branching logic in `cdp_driver.py`, while keeping backend fetches in the existing backend layer.
+Add high-level branching orchestration in `cdp_driver.py`, while continuing to use the existing backend fetch layer for `get_conversation`.
 
 ### Active-chain traversal
 
-1. Call the existing `get_conversation(conversation_id)`.
+1. Call existing `get_conversation(conversation_id)`.
 2. Read `mapping` and `current_node`.
 3. Walk parent links from `current_node` to the root.
 4. Reverse to chronological order.
 5. Ignore system/internal-only entries.
 6. Build visible user/assistant message records.
-7. For each visible assistant answer, associate the nearest preceding visible user prompt.
+7. For every visible assistant answer, associate the nearest preceding visible user prompt.
+8. Retain the exact backend node/message UUID for that assistant answer.
 
 The matching layer must avoid treating internal assistant records such as empty reasoning recap/thought nodes as branchable AI answers.
 
-For each candidate retain internal targeting information needed later, such as:
+### Candidate record
 
+Internally, each branchable candidate should retain at least:
+
+- `message_id` / backend node UUID;
 - assistant answer text;
 - preceding user prompt text;
-- assistant answer ordinal among visible assistant turns;
-- backend message/node ID when available.
+- assistant ordinal among branchable answers, useful only as secondary diagnostics/fallback.
 
-The internal ID/ordinal does not have to be exposed publicly unless it proves useful for diagnostics.
+### Primary identity rule
+
+The supplied live DOM capture shows:
+
+`div[data-message-author-role="assistant"]` has `data-message-id="<uuid>"`, and that UUID corresponds 1-to-1 with the relevant backend mapping node/message UUID.
+
+Therefore:
+
+**Backend `message_id` / node UUID is the primary identity key.**
+
+The intended path is:
+
+`snippet match in backend mapping` → `unique candidate message_id` → `ensure source conversation open` → `find exact DOM assistant element by data-message-id` → `verify role/text` → click that turn's menu.
+
+This is substantially safer than using only assistant ordinal or a second text search in the DOM.
 
 ---
 
@@ -165,34 +200,38 @@ The internal ID/ordinal does not have to be exposed publicly unless it proves us
 
 When exactly one assistant answer matches:
 
-1. Call `ensure_current_conversation(conversation_id)`.
-2. Locate and verify the same assistant answer in the live DOM.
-3. Scroll that assistant turn into view if required.
-4. Open its Three Dots / More-actions menu.
-5. Click the exact **Branch in new chat** menu item.
-6. Wait for ChatGPT to navigate to the new branch.
-7. Read `location.href` from the live tab.
-8. Parse the newly-created conversation ID.
-9. Return the new ID, URL, source conversation information, and lifecycle note.
+1. Keep its exact backend `message_id`.
+2. Call `ensure_current_conversation(conversation_id)`.
+3. Locate the exact assistant DOM message using `data-message-id` and verify `data-message-author-role="assistant"`.
+4. Re-read enough visible answer text from the DOM to confirm it still corresponds to the matched backend candidate.
+5. Resolve the enclosing turn container if needed for action controls.
+6. Scroll the turn into view if necessary.
+7. Open that turn's **More actions** / Three-Dots menu.
+8. Click the exact **Branch in new chat** menu item.
+9. Observe the branch navigation lifecycle.
+10. Wait for the final `/c/...` branch landing.
+11. Parse and return the observed new branch ID and URL.
 
-Required lifecycle note in the successful output:
+Required lifecycle note in successful temporary output:
 
 > This is a temporary link. Once you send your first message to this temporary conversation ID, ChatGPT will automatically upgrade it to a permanent UUID.
 
-If the returned ID does not start with `WEB:` because ChatGPT changed behavior or immediately creates a permanent UUID, return the actual observed ID and clearly report whether it is temporary.
+If ChatGPT changes behavior and returns a permanent UUID immediately, return the actual observed ID and set `temporary=false` rather than incorrectly claiming it is temporary.
 
 ### B. Two or more matches — ambiguity
 
 Do **not** navigate/click Branch after ambiguity is known.
 
-Return a structured ambiguity result containing every matching candidate with at least:
+Return every matching candidate with at least:
 
 - `user_prompt`
 - `assistant_answer`
 
-Optionally include an ordinal/candidate number for readability.
+Recommended additional diagnostic field:
 
-The result must tell the caller to provide a more-specific `message_snippet`.
+- `message_id`
+
+The tool must tell the caller to provide a more-specific `message_snippet`.
 
 ### C. Zero matches — not found
 
@@ -202,13 +241,13 @@ Return a structured result/error containing:
 
 `No matching AI answer found`
 
-Also return the source `conversation_id`, requested snippet, `limit`, and `offset` so the agent can reason about whether it should retry with different pagination or a different snippet.
+Also return the source `conversation_id`, requested snippet, `limit`, and `offset` so the caller can decide whether to retry with different pagination or a different snippet.
 
 ---
 
 ## 5. Proposed Structured Output
 
-Create a dedicated `BRANCH_CONVERSATION_OUTPUT` schema rather than reusing an unrelated status schema.
+Create a dedicated `BRANCH_CONVERSATION_OUTPUT` schema.
 
 Recommended common fields:
 
@@ -223,11 +262,13 @@ Recommended common fields:
 Each match item:
 
 - `candidate`
+- `message_id`
 - `user_prompt`
 - `assistant_answer`
 
 Successful branch fields:
 
+- `source_message_id`
 - `branched_conversation_id`
 - `url`
 - `temporary`: boolean
@@ -243,27 +284,132 @@ Not-found fields:
 - empty `matches`
 - `message = "No matching AI answer found"`
 
-The MCP result should contain useful human-readable text **and** `structuredContent`, not only an opaque success string.
+The MCP result should provide useful human-readable text **and** full `structuredContent`.
 
 ---
 
-## 6. Live DOM Discovery Before Writing the Click Logic
+## 6. Captured DOM and URL Facts to Use
 
-There is currently no Branch-menu helper in `chatgpt_dom.py`. Do not guess the final selectors from memory.
+These are current observed selectors/behaviors supplied for the implementation plan. They are strong starting evidence, but because ChatGPT's DOM changes frequently, the implementation should still verify them against the live page during implementation/E2E.
 
-Before implementing the production helper, inspect a real currently-logged-in ChatGPT conversation through CDP and capture the current DOM shape for:
+### Assistant message
 
-1. assistant message container;
-2. Three Dots / More-actions button inside one assistant turn;
-3. menu/dialog created after clicking it;
-4. exact accessible label/text/role for **Branch in new chat**;
-5. whether the action buttons require hover/focus to render;
-6. what the browser URL becomes immediately after branching;
-7. whether the temporary ID appears literally as `WEB:...` or URL-encoded.
+Observed base element:
 
-Prefer stable semantic attributes (`data-testid`, `aria-label`, `role`, exact menu text) over generated CSS classes.
+```css
+div[data-message-author-role="assistant"]
+```
 
-Do not use a page-global “first three dots” selector. The button search must be scoped to the already-verified target assistant turn.
+Important attribute:
+
+```text
+data-message-id="<exact assistant message UUID>"
+```
+
+This message UUID corresponds 1-to-1 with the backend conversation mapping node/message UUID.
+
+### Turn container
+
+Observed ancestor/container classes include:
+
+- `agent-turn`
+- `group/turn-messages`
+
+These classes should be treated as secondary helpers only because generated/product CSS classes are less stable than semantic attributes.
+
+### Three-Dots / More-actions button
+
+Observed primary selector:
+
+```css
+button[aria-label="More actions"]
+```
+
+Fallback:
+
+```css
+button[aria-label*="More" i]
+```
+
+Useful attributes:
+
+- `type="button"`
+- `aria-label="More actions"`
+- `aria-haspopup="menu"`
+- `data-state="closed"` → `"open"` after click
+
+The Radix-generated `id` is dynamic and must **not** be used as a stable selector.
+
+The visual CSS classes and SVG sprite identifier must also not be treated as canonical selectors.
+
+### Branch menu
+
+Observed menu container:
+
+```css
+div[role="menu"]
+```
+
+and/or a Radix menu content element.
+
+Observed branch item:
+
+```html
+<div role="menuitem">...<div class="truncate">Branch in new chat</div>...</div>
+```
+
+The canonical selection rule should be:
+
+- find the currently open menu;
+- inspect its `[role="menuitem"]` descendants;
+- choose the one whose normalized visible text equals `Branch in new chat`.
+
+**Important implementation note:** `:has-text("Branch in new chat")` is a Playwright selector extension, not standard browser CSS. This project drives the page with CDP + `Runtime.evaluate`, so production code must not pass `:has-text(...)` to `document.querySelector`. Use normal DOM iteration + text comparison instead.
+
+### Observed branch URL lifecycle
+
+Clicking the menu item causes:
+
+1. transient route:
+
+```text
+https://chatgpt.com/branch/{original_conversation_id}/{message_id}
+```
+
+2. immediate redirect to temporary branch:
+
+```text
+https://chatgpt.com/c/WEB:<uuid>
+```
+
+Example:
+
+```text
+https://chatgpt.com/c/WEB:2f2b5fb8-6c16-4a8e-b807-201d5225baed
+```
+
+3. page title observed as:
+
+```text
+Branch · <Original Title>
+```
+
+4. the `WEB:<uuid>` remains temporary until the first prompt is sent in that branch;
+5. after that first prompt, ChatGPT upgrades/navigates the branch to a normal permanent UUID.
+
+### Navigation validation rule
+
+The DOM helper should not consider the operation successful merely because the URL changed once.
+
+It should tolerate the intermediate `/branch/{source}/{message}` route and wait until a final ChatGPT conversation route is observed:
+
+```text
+/c/<new-id>
+```
+
+The final ID must be different from the source conversation ID.
+
+The title prefix `Branch ·` can be used as a secondary diagnostic signal, but URL/ID verification should remain authoritative.
 
 ---
 
@@ -271,24 +417,49 @@ Do not use a page-global “first three dots” selector. The button search must
 
 Add a focused DOM helper, for example:
 
-`branch_assistant_answer(...)`
+`branch_assistant_answer(message_id, expected_text, source_conversation_id)`
 
 Responsibilities:
 
-1. Find visible assistant turns using the same established base selector already used by completion detection: `[data-message-author-role="assistant"]`.
-2. Identify the intended assistant turn using the candidate ordinal/text information supplied by `CDPDriver`.
-3. Re-read and normalize the visible answer text before clicking.
-4. Fail closed if the live DOM no longer corresponds to the unique backend candidate.
-5. Scroll into view.
-6. Reveal action controls if hover/focus is necessary.
-7. click the turn-scoped More/Three-Dots control.
-8. click only the exact Branch menu action.
-9. wait for a navigation/URL change.
-10. return the observed branch URL.
+1. Find the exact assistant element whose `data-message-id` equals the matched backend `message_id`.
+2. Verify it also has `data-message-author-role="assistant"`.
+3. Re-read/normalize the visible assistant text and verify it still corresponds to `expected_text` or the requested unique snippet.
+4. Fail closed if the DOM target cannot be proven to be the backend candidate.
+5. Resolve/scoped-search within that assistant turn/turn container.
+6. Scroll into view.
+7. Reveal action controls if hover/focus is required.
+8. Find the target turn's `button[aria-label="More actions"]`, with the case-insensitive More fallback only if necessary.
+9. Click the button and verify the menu opened (`data-state="open"` and/or visible `role="menu"`).
+10. Within the opened menu, find a `role="menuitem"` whose normalized visible text is exactly `Branch in new chat`.
+11. Click only that exact menu item.
+12. Wait through the optional/transient `/branch/{source_conversation_id}/{message_id}` route.
+13. Continue waiting for the final `/c/<new-id>` route.
+14. Return the observed final branch URL and ID information.
+
+### Selector safety
+
+Do not use a page-global “first three dots” selector.
+
+The More-actions lookup must be scoped to the verified target assistant turn.
+
+Do not rely on:
+
+- Radix-generated element IDs;
+- long CSS class strings;
+- SVG sprite hashes;
+- Playwright-only selector syntax.
+
+### Data passing safety
+
+Prefer passing `message_id`, expected text, and other values through the existing `_js_with_data_strict` / structured-data mechanism instead of interpolating arbitrary text directly into JavaScript selectors.
+
+If CSS escaping is needed, use `CSS.escape(...)` inside the page or avoid selector interpolation by iterating assistant elements and comparing `getAttribute('data-message-id')` directly.
+
+### Failure behavior
 
 If any selector/action cannot be verified, capture useful DOM diagnostics and raise a typed error rather than clicking a possibly-wrong control.
 
-Add a thin `CDPDriver` delegator so test monkeypatching continues to work through the established driver seam.
+Add a thin `CDPDriver` delegator so existing monkeypatch/interception conventions remain intact.
 
 ---
 
@@ -302,46 +473,57 @@ Responsibilities:
 
 1. fetch the source conversation using the existing backend method;
 2. build the active message chain;
-3. build assistant-answer candidates with preceding user prompts;
+3. build assistant-answer candidates with `message_id` + preceding user prompts;
 4. apply `offset`/`limit`;
 5. perform normalized snippet matching;
 6. return not-found/ambiguous results without DOM mutation;
-7. for one match, call `ensure_current_conversation`;
-8. ask the DOM layer to branch the verified assistant turn;
-9. parse the resulting URL/conversation ID;
-10. update `_current_conv_id` only after the branch landing is verified;
+7. for one match, call `ensure_current_conversation(conversation_id)`;
+8. pass the unique candidate's exact `message_id` and expected answer text to the DOM helper;
+9. validate/parse the returned final `/c/...` URL;
+10. set `_current_conv_id` to the observed temporary/permanent branch ID only after the final branch landing is verified;
 11. return the structured branch result.
+
+### Why `message_id` is preferred over ordinal
+
+The first draft planned to use text/ordinal information to identify the same turn in the DOM. The captured `data-message-id` mapping makes that unnecessary as the primary path.
+
+Use:
+
+- backend message/node UUID → primary targeting;
+- visible text/snippet → safety re-verification;
+- ordinal → diagnostics/fallback only, not normal targeting.
 
 ### Temporary ID parsing
 
-The URL parser must support a temporary `WEB:` ID exactly as ChatGPT exposes it.
+The URL parser must support literal `WEB:` identifiers.
 
-If live discovery shows the colon is URL encoded (`WEB%3A...`), use URL decoding in the ID parser and URL matcher rather than adding special string hacks in multiple places.
+The observed current route contains the literal colon, but URL parsing should still be robust if the browser later reports it encoded as `WEB%3A...`; decode the path segment centrally rather than adding special-case string replacements across several call sites.
 
 ---
 
 ## 9. Temporary `WEB:` → Permanent UUID Lifecycle
 
-The expected caller flow is:
+Expected caller flow:
 
-1. `branch_conversation(...)` returns `WEB:...` and the temporary URL.
-2. The agent later calls `chat_completion` with that temporary ID as `conversation_id`.
-3. `chat_completion` uses the existing verified conversation-navigation path.
-4. The first send happens in the temporary branch.
-5. ChatGPT changes the live URL to `/c/{permanent-uuid}`.
-6. Existing `send_and_stream` URL reconciliation should update `_current_conv_id` to that UUID.
-7. `chat_completion` should therefore return the permanent UUID in its existing `conversation_id` field.
+1. `branch_conversation(...)` returns `WEB:...` and its temporary URL.
+2. The agent calls existing `chat_completion` with that temporary ID as `conversation_id`.
+3. `chat_completion` uses existing verified conversation navigation.
+4. The first prompt is sent in the temporary branch.
+5. ChatGPT changes the live route from `/c/WEB:...` to `/c/{permanent-uuid}`.
+6. Existing `send_and_stream` URL reconciliation should update `_current_conv_id` to that permanent UUID.
+7. `chat_completion` should return that permanent UUID through its existing `conversation_id` field.
 
-Implementation should first test this existing behavior.
+Implementation must first test the existing behavior before adding lifecycle-specific code.
 
-Only add new transition-specific code if one of these existing pieces rejects the temporary identifier:
+Specifically verify these existing pieces accept `WEB:`:
 
 - `navigate_conversation` URL construction;
 - `_is_url_at_conversation` exact-path matching;
 - `_conversation_id_from_url` parsing;
-- the post-send URL reconciliation.
+- post-send URL reconciliation;
+- `ChatCompletionInput.conversation_id` validation (currently plain string and expected to accept it).
 
-This keeps the feature small and reuses the existing lifecycle machinery.
+Only add new transition-specific code if one of those pieces demonstrably rejects or mishandles the temporary ID.
 
 ---
 
@@ -358,13 +540,14 @@ The full tool surface becomes **17 tools**.
 
 ### Tool definition
 
-Add a rich MCP definition explaining:
+Add a rich MCP description explaining:
 
 - it branches a specific assistant response;
 - `conversation_id` can be discovered with `list_conversations`;
 - `message_snippet` is matched against assistant answers;
-- duplicates cause a structured ambiguity response and no branch;
-- successful branch IDs may initially be `WEB:` temporary IDs.
+- duplicate matches return structured candidates and do not branch;
+- successful branch IDs are expected initially to be `WEB:` temporary IDs;
+- the first later `chat_completion` on that temporary ID upgrades it to a permanent UUID.
 
 Recommended annotations:
 
@@ -383,7 +566,7 @@ Reason: branching creates a new conversation/account object, but it does not del
 
 Add `branch_conversation` to `_MUTATING_TOOLS`.
 
-The branch operation navigates and clicks inside a real browser tab, so it must participate in the same singleton/per-target mutation locking as chat and other browser mutations.
+The operation navigates and clicks inside a real browser tab, so it must use the same singleton/per-target mutation locking as other browser mutations.
 
 ### Business function
 
@@ -397,16 +580,22 @@ Do not reimplement matching/navigation in `mcp_server.py`.
 
 ### Routing
 
-Register the handler in:
+Register the handler in both:
 
 - `_build_tool_handler(...)` for session-pooled MCP mode;
-- the singleton `call_tool` handler map.
+- singleton `call_tool` routing.
 
-This is important: adding only one path would make the tool work in one MCP mode and fail in the other.
+Adding only one route would make the tool fail in one MCP mode.
 
 ### Result formatting
 
-Extend `_format_tool_result` so branch results provide a concise human-readable text summary plus the complete structured result.
+Extend `_format_tool_result` so branch results provide a concise human-readable summary plus the complete structured result.
+
+Recommended text behavior:
+
+- `branched` → branch ID + URL + temporary lifecycle note;
+- `ambiguous` → explain no branch occurred and candidates are in structured output;
+- `not_found` → clear no-match message.
 
 ---
 
@@ -425,9 +614,20 @@ Create focused tests for:
 7. correct pairing with the immediately preceding user prompt;
 8. internal/system/reasoning nodes ignored;
 9. `offset`/`limit` applied to assistant candidates correctly;
-10. branch is never attempted on 0 or 2+ matches.
+10. branch is never attempted on 0 or 2+ matches;
+11. candidate retains the correct backend `message_id`.
 
-### B. Navigation reuse tests
+### B. Backend-ID ↔ DOM-target tests
+
+Add a high-priority regression test proving:
+
+- backend unique candidate has `message_id = X`;
+- the DOM helper is called with exactly `X`;
+- another assistant turn with similar/equal visible text is never selected if its `data-message-id` differs.
+
+This protects the central safety improvement from the captured DOM information.
+
+### C. Navigation reuse tests
 
 Verify unique-match branching calls `ensure_current_conversation(conversation_id)`.
 
@@ -436,75 +636,100 @@ Test both:
 - conversation already open → no redundant navigation;
 - different conversation open → verified navigation occurs.
 
-### C. DOM tests
+### D. DOM tests
 
 Extend `tests/test_chatgpt_dom.py` or create a focused branch DOM test file.
 
 Test:
 
-1. correct assistant turn selected;
-2. visible answer re-verification before click;
-3. correct turn-scoped Three-Dots button clicked;
-4. exact Branch menu item clicked;
-5. missing More button fails closed;
-6. missing Branch menu item fails closed;
-7. DOM text no longer matches backend candidate → no click;
-8. URL-change wait succeeds;
-9. selector diagnostics run on failure.
+1. exact assistant selected by `data-message-id`;
+2. assistant role verified;
+3. visible answer re-verification before mutation;
+4. target turn's `button[aria-label="More actions"]` selected;
+5. fallback `aria-label*="More"` works when primary label changes;
+6. unrelated More buttons are ignored;
+7. menu-open state is verified;
+8. exact `role="menuitem"` text `Branch in new chat` selected;
+9. no Playwright-only `:has-text()` assumption;
+10. missing More button fails closed;
+11. missing Branch menu item fails closed;
+12. DOM text no longer matches backend candidate → no click;
+13. transient `/branch/{source}/{message}` is tolerated;
+14. final `/c/WEB:...` URL is required before success;
+15. selector diagnostics run on failure.
 
-### D. Temporary-ID tests
+### E. Temporary-ID tests
 
 Test:
 
 1. parser accepts `WEB:...`;
-2. parser handles URL-encoded temporary IDs if live ChatGPT uses them;
+2. parser handles `WEB%3A...` defensively;
 3. `navigate_conversation("WEB:...")` can verify the temporary route;
-4. after a simulated first send changes the live URL to a UUID, `_current_conv_id` becomes that UUID;
-5. `do_chat_completion` returns the permanent UUID after the transition.
+4. `_is_url_at_conversation` handles a literal colon correctly;
+5. `_conversation_id_from_url` returns `WEB:...` correctly;
+6. after a simulated first send changes the live URL to a UUID, `_current_conv_id` becomes that UUID;
+7. `do_chat_completion` returns the permanent UUID after the transition.
 
-### E. MCP business/protocol tests
+### F. Branch URL lifecycle tests
+
+Test the observed sequence explicitly:
+
+1. starting source URL `/c/{source}`;
+2. click causes `/branch/{source}/{message_id}`;
+3. final redirect becomes `/c/WEB:{uuid}`;
+4. tool returns only after step 3;
+5. source ID is not mistaken for result ID;
+6. wrong-host navigation fails closed;
+7. unrelated URL changes fail closed.
+
+Page title `Branch · <Original Title>` may be asserted as a secondary signal, but tests must not make it the sole success criterion.
+
+### G. MCP business/protocol tests
 
 Update `tests/test_business.py` with `do_branch_conversation` cases.
 
 Update protocol integration tests to prove:
 
-- tool appears when the write gate is enabled;
-- tool is hidden/refused without the write gate;
+- tool appears when write gate is enabled;
+- tool is hidden/refused without write gate;
 - unique result returns structured branch output;
 - ambiguity returns candidates instead of branching;
-- pooled and singleton tool routing both reach the same business logic.
+- pooled and singleton routing both reach the same business logic.
 
-### F. Tool-count/gating invariants
+### H. Tool-count/gating invariants
 
-The repository currently has several tests/comments pinned to the 16-tool surface.
+The repository currently has tests/comments pinned to the 16-tool surface.
 
-Update all affected invariants from 16 → 17, including at minimum:
+Update affected invariants from 16 → 17, including at minimum:
 
 - `tests/test_unit.py`
 - `tests/test_deep.py`
 - `tests/test_gating.py`
 - `tests/test_integration.py`
 
-Also update the exact default/write-gated visible-name sets so the new tool is classified correctly.
+Update exact default/write-gated visible-name sets so the new tool is classified correctly.
 
-### G. Opt-in live E2E
+### I. Opt-in live E2E
 
 Add a live E2E scenario against a real authenticated ChatGPT account:
 
 1. create/source a test conversation with a unique known assistant marker;
-2. call `branch_conversation` through the real MCP protocol;
-3. verify the browser moved to a new branch and the returned URL/ID matches the live page;
-4. if the ID is `WEB:...`, call `chat_completion` using that temporary ID;
-5. verify the returned ID becomes a normal permanent UUID after the first message;
-6. register the permanent test conversation in the existing `e2e_created` cleanup registry.
+2. fetch that conversation and record the matched backend assistant `message_id`;
+3. verify the live DOM element uses the same `data-message-id`;
+4. call `branch_conversation` through the real MCP protocol;
+5. verify the browser reaches a new `/c/WEB:...` branch and the returned URL/ID match the live page;
+6. optionally observe/log the transient `/branch/{source}/{message}` route without requiring it to remain visible long enough for every run;
+7. call `chat_completion` using the temporary ID;
+8. verify returned ID becomes a normal permanent UUID after the first message;
+9. register the permanent test conversation in the existing `e2e_created` cleanup registry.
 
-Also add a duplicate-answer E2E or high-fidelity mocked test proving the tool does not branch when more than one candidate matches.
+Also add a duplicate-answer E2E or high-fidelity mocked test proving the tool performs **no branch mutation** when more than one answer matches.
 
 ---
 
 ## 12. Documentation Updates During Implementation
 
-After code/tests pass, update the documentation that describes the MCP surface:
+After code/tests pass, update documentation that describes the MCP surface:
 
 - `README.md`
 - `src/chatgpt_web2api/guide.md`
@@ -512,24 +737,30 @@ After code/tests pass, update the documentation that describes the MCP surface:
 - `CHANGELOG.md` under Unreleased
 - `.env.example` write-gate comments
 
-Update all stale “16 tools” references to 17 where they represent the current surface.
+Update stale “16 tools” references to 17 where they represent the current surface.
 
-Document the new workflow:
+Document the intended workflow:
 
-1. `list_conversations` → discover ID/title/update time.
-2. `branch_conversation` → select source answer by snippet.
-3. resolve ambiguity if returned.
-4. receive temporary branch ID.
-5. `chat_completion(conversation_id="WEB:...")` → first message.
-6. receive permanent UUID.
+1. `list_conversations` → discover `id`, title, update time.
+2. `branch_conversation` → select a source assistant answer by snippet.
+3. if ambiguity is returned, choose a more-specific snippet and retry.
+4. receive `WEB:...` temporary branch ID.
+5. `chat_completion(conversation_id="WEB:...")` → send first branch message.
+6. receive permanent UUID from the existing chat-completion result.
 
 ---
 
 ## 13. Installing the Updated MCP on the Computer
 
-No separate MCP package should be invented. The MCP executable is already provided by the package through the existing `chatgpt-web2api-mcp = chatgpt_web2api.mcp_server:main` entry point in `pyproject.toml`.
+No separate MCP package should be created. The MCP executable is already provided by the package through:
 
-After the feature is implemented in this fork, update the installed package from the fork/local checkout.
+```text
+chatgpt-web2api-mcp = chatgpt_web2api.mcp_server:main
+```
+
+in `pyproject.toml`.
+
+After implementation in this fork, update the installed package from the fork/local checkout.
 
 ### Development/local checkout
 
@@ -549,7 +780,7 @@ pip install --upgrade --force-reinstall git+https://github.com/Mahdi1910/ChatGPT
 
 ### Runtime
 
-REST/Chrome still starts through the existing application, and MCP still uses the existing entry point/transport:
+REST/Chrome still starts through the existing application, and MCP still uses its existing entry point/transport:
 
 ```bash
 chatgpt-web2api
@@ -558,7 +789,7 @@ chatgpt-web2api-mcp --transport sse --port 8090
 
 or use the repository's existing `chatgpt-web2api ensure` workflow where appropriate.
 
-Because the proposed branch tool is WRITE-gated, run MCP with:
+Because the proposed branch tool is WRITE-gated, run MCP with the equivalent of:
 
 ```bash
 W2A_ENABLE_WRITE=1 chatgpt-web2api-mcp --transport sse --port 8090
@@ -566,9 +797,7 @@ W2A_ENABLE_WRITE=1 chatgpt-web2api-mcp --transport sse --port 8090
 
 On Windows, set the equivalent environment variable in the command/supervisor configuration.
 
-After reinstalling/updating the package, restart the MCP server/client connection so the client refreshes `list_tools`. The new `branch_conversation` tool should then appear.
-
-No new MCP client configuration format is required merely because a new tool was added; it uses the existing MCP server connection.
+After reinstalling/updating, restart the MCP server/client connection so the client refreshes `list_tools`. No new MCP client protocol/configuration format is required just because a new tool was added.
 
 ---
 
@@ -594,9 +823,10 @@ For manual MCP verification:
 3. call `list_tools` and confirm `branch_conversation` appears;
 4. call `list_conversations` and confirm `id`, `title`, `update_time`, `gizmo_id` output;
 5. call `branch_conversation` with a unique snippet;
-6. verify the returned URL is exactly the browser's new branch URL;
-7. send the first follow-up using the returned temporary ID;
-8. confirm `chat_completion` returns the permanent UUID.
+6. confirm the backend-matched `message_id` equals the live DOM target's `data-message-id`;
+7. verify the final returned URL is the browser's `/c/WEB:...` URL;
+8. send the first follow-up using the returned temporary ID;
+9. confirm `chat_completion` returns the permanent UUID.
 
 ---
 
@@ -605,17 +835,23 @@ For manual MCP verification:
 The implementation is complete only when all of these are true:
 
 - [ ] `branch_conversation` is exposed as the 17th MCP tool.
-- [ ] It accepts exactly the requested `conversation_id`, `message_snippet`, `limit`, and `offset` contract.
+- [ ] It accepts exactly `conversation_id`, `message_snippet`, `limit`, and `offset` with the requested defaults.
 - [ ] It reuses existing conversation fetching and verified navigation code.
 - [ ] It automatically opens the requested conversation when it is not already open.
 - [ ] It searches assistant answers deterministically.
+- [ ] Backend candidate extraction preserves the exact assistant `message_id` / mapping UUID.
+- [ ] The exact DOM target is selected using matching `data-message-id`, not merely message order.
+- [ ] Visible role/text is re-verified before any branch click.
 - [ ] Zero matches causes no branch and returns a clear not-found result.
 - [ ] Multiple matches cause no branch and return every candidate with preceding user prompt + matching answer.
-- [ ] Exactly one match opens that assistant answer's Three-Dots menu and clicks **Branch in new chat**.
-- [ ] DOM identity is re-verified before mutation so the wrong answer cannot be branched silently.
-- [ ] Successful output returns the observed new conversation ID and URL.
+- [ ] Exactly one match opens that assistant answer's turn-scoped More-actions menu and clicks **Branch in new chat**.
+- [ ] `button[aria-label="More actions"]` is the primary control selector, with a semantic fallback only.
+- [ ] The Branch item is selected from `role="menuitem"` by normalized exact visible text, not Playwright-only selector syntax.
+- [ ] The implementation tolerates the transient `/branch/{source_conversation_id}/{message_id}` route.
+- [ ] Success is returned only after a final `/c/<new-id>` branch route is verified.
+- [ ] Successful temporary output returns the observed `WEB:...` ID and URL.
 - [ ] Successful temporary branches include the exact lifecycle note requested by the user.
-- [ ] A returned `WEB:` temporary conversation can be passed to `chat_completion`.
+- [ ] A returned `WEB:` temporary conversation can be passed directly to `chat_completion`.
 - [ ] After the first message, ChatGPT's permanent UUID is captured and returned through the existing conversation-ID lifecycle.
 - [ ] The tool obeys MCP write gating and mutation locks.
 - [ ] It works in singleton and session-pooled MCP modes.
@@ -654,4 +890,4 @@ Documentation/config comments:
 - `CHANGELOG.md`
 - `.env.example`
 
-`backend_client.py` should not need a new branch endpoint because the actual branch operation is a ChatGPT UI/DOM action. It should change only if implementation discovers a genuinely reusable backend-read requirement that cannot be satisfied through the existing `get_conversation` method.
+`backend_client.py` should not need a new branch endpoint because the actual branch operation is a ChatGPT UI/DOM action. It should change only if implementation discovers a genuinely reusable backend-read requirement that cannot be satisfied through existing `get_conversation`.
