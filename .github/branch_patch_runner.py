@@ -35,5 +35,13 @@ if needle not in source:
     raise RuntimeError("could not adjust the synthetic-clock DOM test")
 source = source.replace(needle, replacement, 1)
 
+# CHANGELOG has historical Added sections. Scope the patch to the current
+# Unreleased section instead of allowing the patcher to guess among them.
+needle = '    "### Added\\n",\n    "### Added\\n- **`branch_conversation` MCP tool (17th)**'
+replacement = '    "## [Unreleased]\\n\\n### Added\\n",\n    "## [Unreleased]\\n\\n### Added\\n- **`branch_conversation` MCP tool (17th)**'
+if needle not in source:
+    raise RuntimeError("could not narrow the CHANGELOG Added anchor")
+source = source.replace(needle, replacement, 1)
+
 namespace = {"__file__": str(patch_path), "__name__": "__main__"}
 exec(compile(source, str(patch_path), "exec"), namespace)
