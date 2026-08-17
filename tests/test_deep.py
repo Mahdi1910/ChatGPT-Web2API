@@ -49,7 +49,7 @@ def test_tool_enum_values():
     """ToolName enum has exactly 15 members."""
     from chatgpt_web2api.mcp_server import ToolName
 
-    assert len(ToolName) == 16
+    assert len(ToolName) == 17
 
 
 def test_tool_enum_unique():

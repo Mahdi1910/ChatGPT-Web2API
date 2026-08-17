@@ -16,6 +16,7 @@ import json
 import logging
 import re
 import time
+import unicodedata
 import urllib.parse
 import urllib.request
 from collections.abc import AsyncIterator
@@ -267,6 +268,14 @@ class SendReadinessError(RuntimeError):
     explicitly at the catch site as ``BreakerKind.COMPOSER_SEND_READINESS``
     rather than guessing from a string. Raised by ``_ensure_send_ready``,
     ``type_message``, and ``click_send``.
+    """
+
+
+class BranchConversationError(RuntimeError):
+    """Raised when a branch UI action cannot be safely verified.
+
+    Branching is fail-closed: the driver never guesses which assistant answer,
+    More-actions button, menu item, or resulting route should be used.
     """
 
 
@@ -1403,7 +1412,7 @@ class CDPDriver:
             return False
         if "chatgpt.com" not in (parsed.netloc or "").lower():
             return False
-        parts = [p for p in parsed.path.split("/") if p]
+        parts = [urllib.parse.unquote(p) for p in parsed.path.split("/") if p]
         # Find the ("c", conversation_id) adjacent pair — the conversation
         # route marker in both non-project (["c", "{id}"]) and project-scoped
         # (["g", "{gizmo}", "c", "{id}"]) URL shapes. Using the adjacent pair
@@ -1478,6 +1487,23 @@ class CDPDriver:
         record_failure on miss / record_success on confirmed send (registry
         stays on driver)."""
         await self._dom.click_send()
+
+    async def branch_assistant_answer(
+        self,
+        message_id: str,
+        message_snippet: str,
+        source_conversation_id: str,
+    ) -> dict:
+        """Branch the exact assistant DOM turn selected by backend message UUID.
+
+        Delegated to ChatGPTDom so page-DOM behavior remains in the canonical
+        DOM layer while CDPDriver preserves the interception/monkeypatch seam.
+        """
+        return await self._dom.branch_assistant_answer(
+            message_id=message_id,
+            message_snippet=message_snippet,
+            source_conversation_id=source_conversation_id,
+        )
 
     # ── Response Retrieval ────────────────────────────────────
 
@@ -1596,7 +1622,8 @@ class CDPDriver:
         Polls briefly (3s at 0.5s intervals). Never raises.
         """
         import time as _time
-        from .chatgpt_dom import COMPOSER_SELECTOR, COMPOSER_FALLBACK_SELECTOR
+
+        from .chatgpt_dom import COMPOSER_FALLBACK_SELECTOR, COMPOSER_SELECTOR
 
         pre_send_count = getattr(self, "_pre_send_user_count", None)
         if pre_send_count is None:
@@ -1991,6 +2018,156 @@ class CDPDriver:
 
         Delegated to BackendClient (Phase 5 PR1 extraction)."""
         return await self._backend_client.get_conversation(conversation_id)
+
+    @diagnose("branch_conversation")
+    async def branch_conversation(
+        self,
+        conversation_id: str,
+        message_snippet: str,
+        limit: int = 28,
+        offset: int = 0,
+    ) -> dict:
+        """Branch from one uniquely matched assistant answer.
+
+        Matching is performed against the source conversation's active backend
+        chain. The backend message UUID is retained and becomes the primary DOM
+        identity key; the user snippet is re-verified in the live DOM before
+        any click occurs.
+        """
+        data = await self.get_conversation(conversation_id)
+        mapping = data.get("mapping", {}) if isinstance(data, dict) else {}
+        current_node = data.get("current_node") if isinstance(data, dict) else None
+        source_title = data.get("title", "") if isinstance(data, dict) else ""
+
+        chain: list[dict] = []
+        visited: set[str] = set()
+        node_id = current_node
+        while node_id and node_id not in visited:
+            visited.add(node_id)
+            node_data = mapping.get(node_id, {}) if isinstance(mapping, dict) else {}
+            msg = node_data.get("message") if isinstance(node_data, dict) else None
+            if isinstance(msg, dict):
+                role = msg.get("author", {}).get("role", "unknown")
+                content = msg.get("content") or {}
+                parts = content.get("parts", []) if isinstance(content, dict) else []
+                text = " ".join(part for part in parts if isinstance(part, str)).strip()
+                if text and role in ("user", "assistant"):
+                    chain.append(
+                        {
+                            "role": role,
+                            "text": text,
+                            "message_id": str(msg.get("id") or node_id),
+                        }
+                    )
+            node_id = node_data.get("parent") if isinstance(node_data, dict) else None
+
+        chain.reverse()
+        candidates: list[dict] = []
+        last_user_prompt = ""
+        for item in chain:
+            if item["role"] == "user":
+                last_user_prompt = item["text"]
+                continue
+            candidates.append(
+                {
+                    "candidate": len(candidates) + 1,
+                    "message_id": item["message_id"],
+                    "user_prompt": last_user_prompt,
+                    "assistant_answer": item["text"],
+                }
+            )
+
+        scanned = candidates[offset : offset + limit]
+
+        def _normalize(value: str) -> str:
+            normalized = unicodedata.normalize("NFC", value or "")
+            return " ".join(normalized.split()).casefold()
+
+        needle = _normalize(message_snippet)
+        matches = [c for c in scanned if needle in _normalize(c["assistant_answer"])]
+
+        def _result_base() -> dict:
+            return {
+                "source_conversation_id": conversation_id,
+                "source_title": source_title,
+                "message_snippet": message_snippet,
+                "offset": offset,
+                "limit": limit,
+                "matches": matches,
+                "source_message_id": None,
+                "branched_conversation_id": None,
+                "url": None,
+                "temporary": None,
+                "note": "",
+                "message": "",
+            }
+
+        if not matches:
+            result = _result_base()
+            result.update(
+                {
+                    "status": "not_found",
+                    "success": False,
+                    "message": (
+                        f"No matching AI answer found for snippet {message_snippet!r} "
+                        f"in conversation {conversation_id}."
+                    ),
+                }
+            )
+            return result
+
+        if len(matches) > 1:
+            result = _result_base()
+            result.update(
+                {
+                    "status": "ambiguous",
+                    "success": False,
+                    "message": (
+                        f"{len(matches)} assistant answers matched the snippet; no branch "
+                        "was created. Provide a more specific message_snippet."
+                    ),
+                }
+            )
+            return result
+
+        match = matches[0]
+        # Navigation + click are mutations. Enforce the owned-tab invariant for
+        # direct driver callers as well as MCP's outer MutationLock.
+        self._assert_owned_tab_required()
+        await self.ensure_current_conversation(conversation_id)
+        branch = await self.branch_assistant_answer(
+            message_id=match["message_id"],
+            message_snippet=message_snippet,
+            source_conversation_id=conversation_id,
+        )
+
+        branch_id = str(branch.get("id") or "")
+        branch_url = str(branch.get("url") or "")
+        if not branch_id or not branch_url or branch_id == conversation_id:
+            raise BranchConversationError("branch landing did not produce a new conversation ID")
+
+        self._current_conv_id = branch_id
+        temporary = bool(branch.get("temporary"))
+        note = (
+            "This is a temporary link. Once you send your first message to this temporary "
+            "conversation ID, ChatGPT will automatically upgrade it to a permanent UUID."
+            if temporary
+            else "ChatGPT returned a permanent conversation ID immediately."
+        )
+        result = _result_base()
+        result.update(
+            {
+                "status": "branched",
+                "success": True,
+                "source_message_id": match["message_id"],
+                "branched_conversation_id": branch_id,
+                "url": branch_url,
+                "temporary": temporary,
+                "note": note,
+                "message": "Conversation branch created successfully.",
+            }
+        )
+        return result
 
     @diagnose("delete_conversation")
     async def delete_conversation(self, conversation_id: str) -> bool:

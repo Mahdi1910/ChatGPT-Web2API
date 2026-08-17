@@ -46,6 +46,7 @@ Level 3: Project (persistent across sessions)
 | Use persistent memory | `chat_completion` | `message` + `project_id` |
 | Create isolated workspace | `create_project` | `name` + `memory_scope` |
 | List recent chats | `list_conversations` | `limit` (default 28) |
+| Branch from an assistant answer | `branch_conversation` | `conversation_id` + unique `message_snippet` |
 | Find a specific chat | `list_conversations` | `search` query |
 | Clean up old chats | `delete_conversation` | `conversation_id` |
 
@@ -117,6 +118,24 @@ To start a new conversation explicitly:
 
 To resume a specific conversation:
 - Pass `conversation_id` from a previous response
+
+### Branching a Conversation
+
+Use `branch_conversation` when you want to split an existing chat from one
+specific assistant answer without changing the source conversation:
+
+```
+branch_conversation(
+    conversation_id="6a...",
+    message_snippet="a unique part of the assistant answer"
+)
+```
+
+If several assistant answers contain the snippet, the tool creates nothing and
+returns every matching candidate with its preceding user prompt. A successful
+branch normally returns a temporary `WEB:<uuid>` ID. Pass that ID directly to
+`chat_completion` for the first message; ChatGPT then upgrades the live branch
+to a normal permanent UUID, which `chat_completion` returns.
 
 ## Model Selection
 

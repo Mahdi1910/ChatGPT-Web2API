@@ -51,8 +51,10 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import time
 import unicodedata
+import urllib.parse
 
 from .breakers import BreakerKind
 
@@ -104,6 +106,29 @@ SEND_BUTTON_BROAD_SELECTOR = (
 # indefinitely on a genuinely broken composer.
 SEND_BUTTON_POLL_INTERVAL_S = 0.3
 SEND_BUTTON_POLL_MAX_WAIT_S = 10.0
+
+
+def _branch_snippet_matches(snippet: str, visible_text: str) -> bool:
+    """Compare a backend-matched snippet against rendered DOM text.
+
+    Markdown punctuation is intentionally ignored by comparing Unicode word
+    tokens first; this lets a backend snippet such as ``**important**`` match
+    rendered ``important`` while still providing an independent text check on
+    top of the exact data-message-id identity.
+    """
+    snippet_nfc = unicodedata.normalize("NFC", snippet or "").casefold()
+    visible_nfc = unicodedata.normalize("NFC", visible_text or "").casefold()
+    snippet_words = re.findall(r"\w+", snippet_nfc, flags=re.UNICODE)
+    visible_words = re.findall(r"\w+", visible_nfc, flags=re.UNICODE)
+    if snippet_words:
+        width = len(snippet_words)
+        return any(
+            visible_words[i : i + width] == snippet_words
+            for i in range(max(0, len(visible_words) - width + 1))
+        )
+    compact_snippet = "".join(snippet_nfc.split())
+    compact_visible = "".join(visible_nfc.split())
+    return bool(compact_snippet) and compact_snippet in compact_visible
 
 
 class ChatGPTDom:
@@ -477,6 +502,191 @@ class ChatGPTDom:
         # type_message alone, since a successful type can still fail to send.
         if d._breakers:
             d._breakers.record_success(BreakerKind.COMPOSER_SEND_READINESS)
+
+    async def branch_assistant_answer(
+        self,
+        *,
+        message_id: str,
+        message_snippet: str,
+        source_conversation_id: str,
+    ) -> dict:
+        """Click ChatGPT's Branch in new chat action for one exact assistant turn.
+
+        ``message_id`` is the primary identity bridge from the backend mapping
+        to ``data-message-id`` in the live DOM. The snippet is independently
+        verified against rendered text before any mutation. Every later step is
+        fail-closed; this method never falls back to constructing /branch URLs.
+        """
+        from .cdp_driver import BranchConversationError, CDPJSError
+
+        d = self._driver
+        probe_js = (
+            "(function(){"
+            "  var nodes=document.querySelectorAll('div[data-message-author-role=\"assistant\"]');"
+            "  var target=null;"
+            "  for(var i=0;i<nodes.length;i++){"
+            "    if(nodes[i].getAttribute('data-message-id')===__D.message_id){target=nodes[i];break;}"
+            "  }"
+            "  if(!target) return JSON.stringify({found:false});"
+            "  target.scrollIntoView({block:'center',inline:'nearest'});"
+            "  target.dispatchEvent(new MouseEvent('mouseover',{bubbles:true,cancelable:true,view:window}));"
+            "  return JSON.stringify({found:true,role:target.getAttribute('data-message-author-role')||'',text:target.innerText||target.textContent||''});"
+            "})()"
+        )
+        try:
+            raw = await d._js_with_data_strict(probe_js, {"message_id": message_id}, timeout=10)
+            probe = json.loads(raw) if isinstance(raw, str) else (raw or {})
+        except (CDPJSError, json.JSONDecodeError, TypeError) as exc:
+            await d._capture_selector_diagnostic("branch target probe")
+            raise BranchConversationError(f"could not inspect target assistant message: {exc}") from exc
+
+        if not probe.get("found") or probe.get("role") != "assistant":
+            await d._capture_selector_diagnostic("branch target missing")
+            raise BranchConversationError(
+                f"assistant message {message_id} is not present in the live conversation DOM"
+            )
+        if not _branch_snippet_matches(message_snippet, probe.get("text", "")):
+            await d._capture_selector_diagnostic("branch target text mismatch")
+            raise BranchConversationError(
+                "live assistant text no longer matches the uniquely selected backend snippet"
+            )
+
+        # Locate the nearest turn container and its More-actions control. The
+        # control can render only after hover, so poll briefly instead of using
+        # a one-shot selector. Generated Radix IDs/classes are deliberately not
+        # used as stable selectors.
+        more_js = (
+            "(function(){"
+            "  var nodes=document.querySelectorAll('div[data-message-author-role=\"assistant\"]');"
+            "  var target=null;"
+            "  for(var i=0;i<nodes.length;i++){if(nodes[i].getAttribute('data-message-id')===__D.message_id){target=nodes[i];break;}}"
+            "  if(!target) return JSON.stringify({clicked:false,reason:'target-missing'});"
+            "  var turn=null,cur=target;"
+            "  for(var depth=0;cur&&cur!==document.body&&depth<12;depth++,cur=cur.parentElement){"
+            "    if(cur.classList&&(cur.classList.contains('agent-turn')||cur.classList.contains('group/turn-messages'))){turn=cur;break;}"
+            "  }"
+            "  if(!turn){"
+            "    cur=target;"
+            "    for(var d2=0;cur&&cur!==document.body&&d2<12;d2++,cur=cur.parentElement){"
+            "      if(cur.querySelector&&cur.querySelector('button[aria-label=\"More actions\"],button[aria-label*=\"More\" i]')){turn=cur;break;}"
+            "    }"
+            "  }"
+            "  if(!turn) return JSON.stringify({clicked:false,reason:'turn-missing'});"
+            "  turn.dispatchEvent(new MouseEvent('mouseover',{bubbles:true,cancelable:true,view:window}));"
+            "  var btn=turn.querySelector('button[aria-label=\"More actions\"]')||turn.querySelector('button[aria-label*=\"More\" i]');"
+            "  if(!btn) return JSON.stringify({clicked:false,reason:'more-missing'});"
+            "  var evts=['pointerdown','mousedown','pointerup','mouseup','click'];"
+            "  for(var j=0;j<evts.length;j++){btn.dispatchEvent(new MouseEvent(evts[j],{bubbles:true,cancelable:true,view:window}));}"
+            "  return JSON.stringify({clicked:true,state:btn.getAttribute('data-state')||'',controls:btn.getAttribute('aria-controls')||''});"
+            "})()"
+        )
+        more_state = None
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            try:
+                raw = await d._js_with_data_strict(more_js, {"message_id": message_id}, timeout=10)
+                state = json.loads(raw) if isinstance(raw, str) else (raw or {})
+            except (CDPJSError, json.JSONDecodeError, TypeError):
+                state = {}
+            if state.get("clicked"):
+                more_state = state
+                break
+            await asyncio.sleep(0.25)
+        if not more_state:
+            await d._capture_selector_diagnostic("branch More actions")
+            raise BranchConversationError("More actions button did not appear for the target turn")
+
+        menu_js = (
+            "(function(){"
+            "  function visible(el){if(!el)return false;var s=getComputedStyle(el),r=el.getBoundingClientRect();return s.display!=='none'&&s.visibility!=='hidden'&&r.width>0&&r.height>0;}"
+            "  var menu=__D.controls?document.getElementById(__D.controls):null;"
+            "  if(!menu||!visible(menu)){var menus=document.querySelectorAll('[role=\"menu\"]');for(var i=menus.length-1;i>=0;i--){if(visible(menus[i])){menu=menus[i];break;}}}"
+            "  if(!menu) return JSON.stringify({clicked:false,reason:'menu-missing'});"
+            "  var items=menu.querySelectorAll('[role=\"menuitem\"]');"
+            "  for(var j=0;j<items.length;j++){"
+            "    var text=(items[j].innerText||items[j].textContent||'').replace(/\s+/g,' ').trim();"
+            "    if(text==='Branch in new chat'){"
+            "      var evts=['pointerdown','mousedown','pointerup','mouseup','click'];"
+            "      for(var k=0;k<evts.length;k++){items[j].dispatchEvent(new MouseEvent(evts[k],{bubbles:true,cancelable:true,view:window}));}"
+            "      return JSON.stringify({clicked:true});"
+            "    }"
+            "  }"
+            "  return JSON.stringify({clicked:false,reason:'branch-item-missing'});"
+            "})()"
+        )
+        menu_clicked = False
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            try:
+                raw = await d._js_with_data_strict(
+                    menu_js,
+                    {"controls": more_state.get("controls", "")},
+                    timeout=10,
+                )
+                state = json.loads(raw) if isinstance(raw, str) else (raw or {})
+            except (CDPJSError, json.JSONDecodeError, TypeError):
+                state = {}
+            if state.get("clicked"):
+                menu_clicked = True
+                break
+            await asyncio.sleep(0.25)
+        if not menu_clicked:
+            await d._capture_selector_diagnostic("branch menu item")
+            raise BranchConversationError("Branch in new chat menu item did not appear")
+
+        # ChatGPT currently visits /branch/{source}/{message} transiently and
+        # then redirects to /c/WEB:<uuid>. Only the final /c/<new-id> is a
+        # successful branch landing. Any unrelated navigation fails closed.
+        deadline = time.monotonic() + 15.0
+        last_url = ""
+        while time.monotonic() < deadline:
+            try:
+                raw = await d._js_strict(
+                    "(function(){return JSON.stringify({url:location.href,title:document.title});})()",
+                    timeout=5,
+                )
+                state = json.loads(raw) if isinstance(raw, str) else (raw or {})
+            except (CDPJSError, json.JSONDecodeError, TypeError):
+                await asyncio.sleep(0.25)
+                continue
+            url = state.get("url", "") or ""
+            last_url = url
+            try:
+                parsed = urllib.parse.urlparse(url)
+            except ValueError:
+                parsed = None
+            host = (parsed.hostname or "").lower() if parsed else ""
+            if host and host != "chatgpt.com" and not host.endswith(".chatgpt.com"):
+                raise BranchConversationError(f"branch navigation left chatgpt.com: {url}")
+            parts = [urllib.parse.unquote(p) for p in (parsed.path.split("/") if parsed else []) if p]
+            if len(parts) >= 3 and parts[0] == "branch":
+                if parts[1] != source_conversation_id or parts[2] != message_id:
+                    raise BranchConversationError(f"branch route targeted an unexpected source/message: {url}")
+                await asyncio.sleep(0.25)
+                continue
+            for i in range(len(parts) - 1):
+                if parts[i] != "c":
+                    continue
+                new_id = parts[i + 1]
+                if new_id == source_conversation_id:
+                    break
+                if new_id:
+                    return {
+                        "id": new_id,
+                        "url": url,
+                        "temporary": new_id.startswith("WEB:"),
+                        "title": state.get("title", "") or "",
+                    }
+            # Remaining on the source URL while the SPA reacts is expected;
+            # changing to some unrelated route is not.
+            if url and source_conversation_id not in url and "/branch/" not in url:
+                raise BranchConversationError(f"unexpected branch navigation state: {url}")
+            await asyncio.sleep(0.25)
+
+        await d._capture_selector_diagnostic("branch final URL")
+        raise BranchConversationError(
+            f"branch did not reach a new /c/<id> URL within 15s (last URL: {last_url})"
+        )
 
     # ── Rate-limit popup ──────────────────────────────────────
 

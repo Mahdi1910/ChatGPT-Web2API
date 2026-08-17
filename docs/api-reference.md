@@ -95,6 +95,7 @@ Returns available ChatGPT models:
 | `update_project_instructions` | `project_id`, `instructions` | Confirmation |
 | `create_memory` | `content` | Confirmation |
 | `archive_conversation` | `conversation_id`, `archive` | Confirmation |
+| `branch_conversation` | `conversation_id`, `message_snippet`, `limit?`, `offset?` | Branched WEB:/UUID ID, or structured ambiguity/not-found result |
 | `delete_conversation` | `conversation_id` | Confirmation |
 | `delete_memory` | `memory_id` | Confirmation |
 

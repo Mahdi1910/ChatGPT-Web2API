@@ -57,6 +57,7 @@ def test_default_surface_excludes_write_and_destructive(monkeypatch):
     for tn in [
         ToolName.CREATE_PROJECT, ToolName.UPDATE_PROJECT_INSTRUCTIONS,
         ToolName.CREATE_MEMORY, ToolName.ARCHIVE_CONVERSATION,
+        ToolName.BRANCH_CONVERSATION,
     ]:
         assert tn.value not in visible, f"{tn.value} must be hidden by default"
 
@@ -93,6 +94,7 @@ def test_write_env_exposes_mutating_tools(monkeypatch):
     for tn in [
         ToolName.CREATE_PROJECT, ToolName.UPDATE_PROJECT_INSTRUCTIONS,
         ToolName.CREATE_MEMORY, ToolName.ARCHIVE_CONVERSATION,
+        ToolName.BRANCH_CONVERSATION,
     ]:
         assert tn.value in visible, f"{tn.value} should appear with {WRITE_ENV}=1"
 
@@ -118,7 +120,7 @@ def test_both_gates_expose_all_sixteen(monkeypatch):
     clear_gate_envs(monkeypatch)
     monkeypatch.setenv(WRITE_ENV, "1")
     monkeypatch.setenv(DESTRUCTIVE_ENV, "1")
-    assert len(build_tools()) == 16
+    assert len(build_tools()) == 17
 
 
 # ── Block-at-call: hidden tools refuse to execute ─────────────
