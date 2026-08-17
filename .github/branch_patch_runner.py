@@ -45,3 +45,15 @@ source = source.replace(needle, replacement, 1)
 
 namespace = {"__file__": str(patch_path), "__name__": "__main__"}
 exec(compile(source, str(patch_path), "exec"), namespace)
+
+# cdp_driver already had this local import in non-isort order. Because this
+# feature legitimately edits the driver, leave the touched file lint-clean
+# without changing unrelated test files that currently have their own baseline
+# lint findings.
+cdp_path = patch_path.parents[1] / "src/chatgpt_web2api/cdp_driver.py"
+cdp = cdp_path.read_text(encoding="utf-8")
+old_import = "        from .chatgpt_dom import COMPOSER_SELECTOR, COMPOSER_FALLBACK_SELECTOR\n"
+new_import = "        from .chatgpt_dom import COMPOSER_FALLBACK_SELECTOR, COMPOSER_SELECTOR\n"
+if old_import not in cdp:
+    raise RuntimeError("could not normalize existing local chatgpt_dom import")
+cdp_path.write_text(cdp.replace(old_import, new_import, 1), encoding="utf-8")
